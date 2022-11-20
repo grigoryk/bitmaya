@@ -8,19 +8,79 @@ use std::io::Read;
 use url::Url;
 use std::net::TcpStream;
 
-trait InfoHash {
-    fn info_hash(&self) -> String;
+#[derive(Debug)]
+struct Peer {
+    addr: [u8; 6]
 }
 
-trait AsTorrent {
-    fn to_torrent(self) -> Torrent;
+trait InfoHash {
+    fn info_hash(&self) -> String;
 }
 
 #[derive(Debug)]
 struct Torrent {
     announce_url: String,
     pieces_length: i64,
-    info_bytes: Vec<u8>
+    info_bytes: Vec<u8>,
+    peers: Vec<Peer>,
+}
+
+impl Torrent {
+    fn announce(&mut self) -> Result<(), &'static str> {
+        let announce = Url::parse_with_params(format!("{}{}?info_hash={}", self.announce_url, "/announce", self.info_hash()).as_str(), &[
+            ("peer_id", "-DE211s-pMaStd.(9qxs".to_string()),
+            ("port", 5035.to_string()),
+            ("uploaded", "0".to_string()),
+            ("downloaded", "0".to_string()),
+            ("compact", "1".to_string()),
+            ("event", "paused".to_string()),
+            ("numwant", 50.to_string()),
+            ("left", self.pieces_length.to_string()),
+        ]).expect("parsed");
+        println!("announce url: {}", announce);
+        let mut res = match reqwest::blocking::get(announce) {
+            Ok(res) => res,
+            Err(e) => {
+                println!("{}", e);
+                return Err("reqwset get error")
+            }
+        };
+        let mut body = vec!();
+        match res.read_to_end(&mut body) {
+            Ok(_) => (),
+            Err(_) => return Err("error on res.read_to_end")
+        };
+
+        println!("Status: {}", res.status());
+        let bt = match parse_bytes(&mut body.iter().peekable()) {
+            Ok(bt) => bt,
+            Err(e) => {
+                println!("bencode parse error: {:?}", e);
+                return Err("bencode parse error")
+            }
+        };
+
+        print!("Bencode response: {}", bt);
+
+        let response: HashMap<String, BencodeItem> = if let BencodeItem::Dict(d) = bt {
+            d.into_iter().collect()
+        } else {
+            return Err("respone not dict")
+        };
+
+        let peers = match response.get("peers6") {
+            Some(BencodeItem::String(p)) => p,
+            Some(_) => return Err("expected peers bytestring"),
+            None => return Err("missing peers")
+        };
+
+        for i in (0..peers.bytes.len()).step_by(6) {
+            let peer = &peers.bytes[i..i+6];
+            self.peers.push(Peer { addr: peer.try_into().expect("wrong addr size") });
+        }
+
+        Ok(())
+    }
 }
 
 impl TryFrom<BencodeItem> for Torrent {
@@ -63,7 +123,8 @@ impl TryFrom<BencodeItem> for Torrent {
         Ok(Torrent {
             announce_url,
             pieces_length,
-            info_bytes: info.as_bytes()
+            info_bytes: info.as_bytes(),
+            peers: vec!()
         })
     }
 }
@@ -77,10 +138,6 @@ impl InfoHash for Torrent {
     }
 }
 
-struct Peer {
-
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     let file_path = &args[1];
@@ -88,55 +145,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Bencode:");
     println!("{}", bt);
 
-    let torrent: Torrent = bt.try_into().expect("torrent file");
+    let mut torrent: Torrent = bt.try_into()?;
     println!("Torrent:");
     println!("{:?}", torrent);
 
-    let announce = Url::parse_with_params(format!("{}{}?info_hash={}", torrent.announce_url, "/announce", torrent.info_hash()).as_str(), &[
-        ("peer_id", "-DE211s-pMaStd.(9qxs".to_string()),
-        ("port", 5035.to_string()),
-        ("uploaded", "0".to_string()),
-        ("downloaded", "0".to_string()),
-        ("compact", "1".to_string()),
-        ("event", "paused".to_string()),
-        ("numwant", 50.to_string()),
-        ("left", torrent.pieces_length.to_string()),
-    ]).expect("parsed");
-    println!("announce url: {}", announce);
-    let mut res = reqwest::blocking::get(announce)?;
-    let mut body = vec!();
-    res.read_to_end(&mut body)?;
+    torrent.announce()?;
 
-    println!("Status: {}", res.status());
-    // println!("Headers:\n{:#?}", res.headers());
-    let bt = match parse_bytes(&mut body.iter().peekable()) {
-        Ok(bt) => bt,
-        Err(e) => panic!("bencode parse error: {:?}", e)
-    };
-
-    print!("Bencode response: {}", bt);
-
-    let response: HashMap<String, BencodeItem> = if let BencodeItem::Dict(d) = bt {
-        d.into_iter().collect()
-    } else {
-        panic!("3")
-    };
-
-    let peers = match response.get("peers6") {
-        Some(BencodeItem::String(p)) => p,
-        Some(_) => panic!("expected peers bytestring"),
-        None => panic!("missing peers")
-    };
-
-    let mut peer_addresses = vec!();
-
-
-
-    for i in (0..peers.bytes.len()).step_by(6) {
-        let peer = &peers.bytes[i..i+6];
-        peer_addresses.push(peer);
-        println!("peer: {:?}", peer);
-    }
+    println!("got peers:");
+    println!("{:?}", torrent.peers);
 
     // TcpStream::connect_timeout(addr, Duration::from_secs(10));
 
