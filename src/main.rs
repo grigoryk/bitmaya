@@ -1,16 +1,38 @@
 use std::time::Duration;
 use std::{env, collections::HashMap};
 use form_urlencoded::byte_serialize;
-use mescal::{open, parse_bytes, BencodeItem, AsBencodeBytes, BencodeError};
+use mescal::{BencodeItem, AsBencodeBytes, ByteString};
 use sha1::{Sha1, Digest};
 use std::error::Error;
 use std::io::Read;
 use url::Url;
 use std::net::TcpStream;
 
+const CLIENT_ID: &str = "-BM0010-123456789012";
+
+#[derive(Debug)]
+enum PeerState {
+    NotChokingNotInterested,
+    NotChokingInerested,
+    ChokingNotInterested,
+    ChokingInterested
+}
+
 #[derive(Debug)]
 struct Peer {
-    addr: [u8; 6]
+    addr: [u8; 6],
+    us: PeerState,
+    them: PeerState
+}
+
+impl Peer {
+    fn new(addr: [u8; 6]) -> Self {
+        Peer {
+            addr,
+            us: PeerState::ChokingNotInterested,
+            them: PeerState::ChokingNotInterested
+        }
+    }
 }
 
 trait InfoHash {
@@ -18,25 +40,47 @@ trait InfoHash {
 }
 
 #[derive(Debug)]
-struct Torrent {
+struct Tracker {
     announce_url: String,
+    tracker_id: Option<String>,
+    interval: i64,
+    min_interval: Option<i64>,
+}
+
+#[derive(Debug)]
+struct Torrent {
+    trackers: Vec<Tracker>,
     pieces_length: i64,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
+
+    // our state
+    uploaded: i64,
+    downloaded: i64,
 }
 
 impl Torrent {
-    fn announce(&mut self) -> Result<(), &'static str> {
-        let announce = Url::parse_with_params(format!("{}{}?info_hash={}", self.announce_url, "/announce", self.info_hash()).as_str(), &[
-            ("peer_id", "-DE211s-pMaStd.(9qxs".to_string()),
-            ("port", 5035.to_string()),
+    fn announce(&mut self, port: i64) -> Result<(), &'static str> {
+        let tracker = self.trackers.first().expect("torrent missing tracker");
+        let mut params = vec!(
+            ("peer_id", CLIENT_ID.to_string()),
+            ("port", port.to_string()),
             ("uploaded", "0".to_string()),
             ("downloaded", "0".to_string()),
             ("compact", "1".to_string()),
             ("event", "paused".to_string()),
             ("numwant", 50.to_string()),
             ("left", self.pieces_length.to_string()),
-        ]).expect("parsed");
+        );
+        if let Some(known_tracker_id) = &tracker.tracker_id {
+            params.push(("trackerid", known_tracker_id.clone()))        }
+        let announce = Url::parse_with_params(
+            format!("{}/announce?info_hash={}",
+                tracker.announce_url,
+                self.info_hash()
+            ).as_str(),
+            params
+        ).expect("announce url parsed");
         println!("announce url: {}", announce);
         let mut res = match reqwest::blocking::get(announce) {
             Ok(res) => res,
@@ -52,7 +96,7 @@ impl Torrent {
         };
 
         println!("Status: {}", res.status());
-        let bt = match parse_bytes(&mut body.iter().peekable()) {
+        let bt = match mescal::parse_bytes(&mut body.iter().peekable()) {
             Ok(bt) => bt,
             Err(e) => {
                 println!("bencode parse error: {:?}", e);
@@ -76,7 +120,7 @@ impl Torrent {
 
         for i in (0..peers.bytes.len()).step_by(6) {
             let peer = &peers.bytes[i..i+6];
-            self.peers.push(Peer { addr: peer.try_into().expect("wrong addr size") });
+            self.peers.push(Peer::new(peer.try_into().expect("wrong addr size")));
         }
 
         Ok(())
@@ -110,21 +154,41 @@ impl TryFrom<BencodeItem> for Torrent {
         let announce_url: String = match torrent_map.get("announce") {
             Some(BencodeItem::String(s)) => match s.try_into() {
                 Ok(s) => s,
-                Err(_) => return Err("announce stringify err:"),
+                Err(_) => return Err("announce stringify err"),
             },
             Some(_) => return Err("announce not string"),
             None => return Err("announce missing")
+        };
+        let interval = match torrent_map.get("interval") {
+            Some(BencodeItem::Int(i)) => *i,
+            Some(_) => return Err("interval not string"),
+            None => return Err("interval missing")
+        };
+        let tracker_id = match torrent_map.get("trackerid") {
+            Some(BencodeItem::String(s)) => match s.try_into() {
+                Ok(s) => Some(s),
+                Err(_) => return Err("trackerid stringify err"),
+            },
+            Some(_) => return Err("trackerid not string"),
+            None => None
         };
         let pieces_length = match info_map.get(&"piece length".to_string()) {
             Some(BencodeItem::Int(i)) => *i,
             Some(_) => return Err("pieces length not int"),
             None => return Err("missing pieces length")
         };
+
+        // trackerid
+        // interval
+        // mininterval
+
         Ok(Torrent {
-            announce_url,
+            trackers: vec!(Tracker { announce_url, tracker_id, interval, min_interval: None }),
             pieces_length,
             info_bytes: info.as_bytes(),
-            peers: vec!()
+            peers: vec!(),
+            uploaded: 0,
+            downloaded: 0
         })
     }
 }
@@ -141,7 +205,7 @@ impl InfoHash for Torrent {
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     let file_path = &args[1];
-    let bt = open(file_path).expect("parsed .torrent");
+    let bt = mescal::open(file_path).expect("parsed .torrent");
     println!("Bencode:");
     println!("{}", bt);
 
@@ -149,7 +213,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Torrent:");
     println!("{:?}", torrent);
 
-    torrent.announce()?;
+    torrent.announce(5035)?;
 
     println!("got peers:");
     println!("{:?}", torrent.peers);
