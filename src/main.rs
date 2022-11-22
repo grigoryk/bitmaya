@@ -4,9 +4,10 @@ use form_urlencoded::byte_serialize;
 use mescal::{BencodeItem, AsBencodeBytes, ByteString};
 use sha1::{Sha1, Digest};
 use std::error::Error;
-use std::io::Read;
+use std::io::{Read, Write};
 use url::Url;
-use std::net::TcpStream;
+use std::net::{TcpStream, SocketAddr, Shutdown, IpAddr, Ipv4Addr};
+use std::str::from_utf8;
 
 const CLIENT_ID: &str = "-BM0010-123456789012";
 
@@ -32,6 +33,16 @@ impl Peer {
             us: PeerState::ChokingNotInterested,
             them: PeerState::ChokingNotInterested
         }
+    }
+
+    fn handshake(&self) -> Result<(), &'static str> {
+        let ip = IpAddr::V4(Ipv4Addr::new(self.addr[0], self.addr[1], self.addr[2], self.addr[3]));
+        let port = ((self.addr[4] as u16) << 8) | self.addr[5] as u16;
+        let addr = SocketAddr::new(ip, port);
+        println!("handshake with {}", addr);
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).expect("connected to peer");
+        stream.shutdown(Shutdown::Both).expect("shutdown");
+        Ok(())
     }
 }
 
@@ -129,7 +140,7 @@ impl Torrent {
             None => ()
         };
 
-        let peers = match response.get("peers6") {
+        let peers = match response.get("peers") {
             Some(BencodeItem::String(p)) => p,
             Some(_) => return Err("expected peers bytestring"),
             None => return Err("missing peers")
@@ -230,7 +241,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("got peers:");
     println!("{:?}", torrent.peers);
 
-    // TcpStream::connect_timeout(addr, Duration::from_secs(10));
+    torrent.peers[0].handshake()?;
 
     Ok(())
 }
