@@ -43,7 +43,7 @@ trait InfoHash {
 struct Tracker {
     announce_url: String,
     tracker_id: Option<String>,
-    interval: i64,
+    interval: Option<i64>,
     min_interval: Option<i64>,
 }
 
@@ -61,7 +61,8 @@ struct Torrent {
 
 impl Torrent {
     fn announce(&mut self, port: i64) -> Result<(), &'static str> {
-        let tracker = self.trackers.first().expect("torrent missing tracker");
+        let info_hash = self.info_hash();
+        let tracker = self.trackers.first_mut().expect("torrent missing tracker");
         let mut params = vec!(
             ("peer_id", CLIENT_ID.to_string()),
             ("port", port.to_string()),
@@ -77,7 +78,7 @@ impl Torrent {
         let announce = Url::parse_with_params(
             format!("{}/announce?info_hash={}",
                 tracker.announce_url,
-                self.info_hash()
+                info_hash
             ).as_str(),
             params
         ).expect("announce url parsed");
@@ -110,6 +111,22 @@ impl Torrent {
             d.into_iter().collect()
         } else {
             return Err("respone not dict")
+        };
+
+        tracker.interval = match response.get("interval") {
+            Some(BencodeItem::Int(i)) => Some(*i),
+            Some(_) => return Err("interval not string"),
+            None => return Err("interval missing")
+        };
+
+        // if trackerid missing, don't erase one we may have
+        match response.get("trackerid") {
+            Some(BencodeItem::String(s)) => match s.try_into() {
+                Ok(ss) => tracker.tracker_id = Some(ss),
+                Err(_) => return Err("trackerid parse err")
+            },
+            Some(_) => return Err("trackerid not string"),
+            None => ()
         };
 
         let peers = match response.get("peers6") {
@@ -159,11 +176,6 @@ impl TryFrom<BencodeItem> for Torrent {
             Some(_) => return Err("announce not string"),
             None => return Err("announce missing")
         };
-        let interval = match torrent_map.get("interval") {
-            Some(BencodeItem::Int(i)) => *i,
-            Some(_) => return Err("interval not string"),
-            None => return Err("interval missing")
-        };
         let tracker_id = match torrent_map.get("trackerid") {
             Some(BencodeItem::String(s)) => match s.try_into() {
                 Ok(s) => Some(s),
@@ -183,7 +195,7 @@ impl TryFrom<BencodeItem> for Torrent {
         // mininterval
 
         Ok(Torrent {
-            trackers: vec!(Tracker { announce_url, tracker_id, interval, min_interval: None }),
+            trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
             pieces_length,
             info_bytes: info.as_bytes(),
             peers: vec!(),
