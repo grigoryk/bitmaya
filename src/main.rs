@@ -12,6 +12,8 @@ use rand::seq::SliceRandom;
 use std::fmt;
 use std::str::from_utf8;
 
+mod message;
+
 const CLIENT_ID: &str = "-BM0010-123456789012";
 
 #[derive(Debug)]
@@ -37,62 +39,6 @@ impl Peer {
             them: PeerState::ChokingNotInterested
         }
     }
-
-    fn handshake(&self, torrent: &Torrent) -> Result<(), &'static str> {
-        let ip = IpAddr::V4(Ipv4Addr::new(self.addr[0], self.addr[1], self.addr[2], self.addr[3]));
-        let port = ((self.addr[4] as u16) << 8) | self.addr[5] as u16;
-        let addr = SocketAddr::new(ip, port);
-        println!("handshake with {}", addr);
-        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
-            Ok(s) => s,
-            Err(e) => {
-                println!("connection error: {}", e);
-                return Err("failed to connect")
-            }
-        };
-        let mut message = vec!();
-
-        let pstrlen = 19;
-        println!("pstrlen: {:x?}", pstrlen);
-
-        let mut pstr = "BitTorrent protocol".as_bytes().to_vec();
-        println!("pstr: {:x?}", pstr);
-
-        let mut reserved = [0, 0, 0, 0, 0, 0, 0, 0].to_vec();
-        println!("reserved: {:x?}", reserved);
-
-        let mut info_hash = torrent.info_hash_bytes().to_vec();
-        println!("info_hash: {:x?}", info_hash);
-
-        let mut peer_id = CLIENT_ID.as_bytes().to_vec();
-        println!("peer_id: {:x?}", peer_id);
-
-
-        message.push(pstrlen);
-        message.append(&mut pstr);
-        message.append(&mut reserved);
-        message.append(&mut info_hash);
-        message.append(&mut peer_id);
-
-        println!("handshake message - client: {:x?}", message);
-        println!("handshake message length: {}", message.len());
-
-        match stream.write(&mut message) {
-            Ok(b) => println!("handshake wrote bytes: {}", b),
-            Err(e) => panic!("handshake write err: {}", e)
-        };
-
-        let mut res: Vec<u8> = vec!();
-        match stream.read_to_end(&mut res) {
-            Ok(b) => println!("handshake read bytes: {}", b),
-            Err(e) => panic!("handshake read err: {}", e),
-        };
-
-        println!("read response: {:x?}", res);
-
-        stream.shutdown(Shutdown::Both).expect("shutdown");
-        Ok(())
-    }
 }
 
 trait InfoHash {
@@ -112,6 +58,7 @@ struct Tracker {
 struct Torrent {
     trackers: Vec<Tracker>,
     pieces_length: i64,
+    pieces: Vec<u8>,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
 
@@ -220,6 +167,135 @@ impl Torrent {
 
         Ok(())
     }
+
+    fn connect_peer(&self, peer: &Peer) -> Result<(), &'static str> {
+        let mut our_state = PeerState::ChokingNotInterested;
+        let mut their_state = PeerState::ChokingNotInterested;
+
+        let ip = IpAddr::V4(Ipv4Addr::new(peer.addr[0], peer.addr[1], peer.addr[2], peer.addr[3]));
+        let port = ((peer.addr[4] as u16) << 8) | peer.addr[5] as u16;
+        let addr = SocketAddr::new(ip, port);
+        println!("handshake with {}", addr);
+        let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("connection error: {}", e);
+                return Err("failed to connect")
+            }
+        };
+        let mut message = vec!();
+
+        let pstrlen = 19;
+        println!("pstrlen: {:x?}", pstrlen);
+
+        let mut pstr = "BitTorrent protocol".as_bytes().to_vec();
+        println!("pstr: {:x?}", pstr);
+
+        let mut reserved = [0, 0, 0, 0, 0, 0, 0, 0].to_vec();
+        println!("reserved: {:x?}", reserved);
+
+        let info_hash_bytes = self.info_hash_bytes();
+
+        let mut info_hash = info_hash_bytes.to_vec();
+        println!("info_hash: {:x?}", info_hash);
+
+        let mut peer_id = CLIENT_ID.as_bytes().to_vec();
+        println!("peer_id: {:x?}", peer_id);
+
+        message.push(pstrlen);
+        message.append(&mut pstr);
+        message.append(&mut reserved);
+        message.append(&mut info_hash);
+        message.append(&mut peer_id);
+
+        println!("handshake message - client: {:x?}", message);
+        println!("handshake message length: {}", message.len());
+
+        match stream.write(&mut message) {
+            Ok(b) => println!("handshake wrote bytes: {}", b),
+            Err(e) => panic!("handshake write err: {}", e)
+        };
+
+        let mut buff: [u8; 68] = [0; 68]; // expecting 68 for handshake, 49+len(pstr) assuming pstr="BitTorrent protocol"
+        // read handshake response
+        match stream.read(&mut buff) {
+            Ok(n) => println!("read {} bytes: {:x?}", n, buff),
+            Err(e) => println!("error reading bytes: {}", e),
+        };
+        let other_pstrlen: usize = buff[0].into();
+        let other_info_hash = buff.get(1+other_pstrlen+8..1+other_pstrlen+8+20).expect("peer sends info hash");
+
+        println!("handshake response:");
+        println!("pstrlen: {}", buff[0]);
+        println!("pstr: {:x?}", buff.get(1..other_pstrlen));
+        println!("reserved: {:x?}", buff.get(1+other_pstrlen..1+other_pstrlen+8));
+        println!("info_hash: {:x?}", other_info_hash);
+        println!("peer_id: {:x?}", from_utf8(buff.get(1+other_pstrlen+8+20..1+other_pstrlen+8+20+20).unwrap()));
+
+        let info_hash_slice = &info_hash_bytes[..];
+        let other_info_hash_slice = &other_info_hash[..];
+        println!("ours: {:?}, theirs: {:?}", info_hash_slice, other_info_hash_slice);
+
+        if info_hash_slice != other_info_hash_slice {
+            return Err("info_hashes do not match")
+        }
+
+        let mut interested_message = vec!();
+        interested_message.push(0x0);
+        interested_message.push(0x0);
+        interested_message.push(0x0);
+        interested_message.push(0x1);
+        interested_message.append(&mut (String::from("2")).into_bytes());
+
+        println!("sending interested message: {:x?}", interested_message);
+        match stream.write(&interested_message) {
+            Ok(b) => println!("wrote interested message, b={}", b),
+            Err(e) => println!("err writing interested message, {}", e),
+        }
+        let mut buff = [0; 100];
+        match stream.read(&mut buff) {
+            Ok(n) => {
+                println!("read {} bytes:", n);
+                for i in 0..n {
+                    println!("byte {}: {:b} - {}", i, buff[i], buff[i])
+                }
+            },
+            Err(e) => println!("error reading bytes: {}", e),
+        };
+        let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
+        let mut has_pieces = 0;
+        println!("there are {} pieces", num_of_pieces);
+        for i in 0..num_of_pieces {
+            println!("checking piece {}", i);
+            let nth = i % 8;
+            println!("bitmask {:08b}", 128 >> nth);
+            let byte_num = i / 8;
+            println!("byte number: {}", byte_num);
+            println!("{:b} & {:08b}", buff[5 + byte_num], 128 >> nth);
+            if buff[5 + byte_num] & 128 >> nth != 0 {
+                println!("has piece {}", i);
+                has_pieces += 1;
+            } else {
+                println!("missing piece {}", i);
+            }
+        }
+        println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
+
+        our_state = PeerState::ChokingInterested;
+
+        stream.shutdown(Shutdown::Both).expect("shutdown");
+        Ok(())
+    }
+
+    fn connect(&self) -> Result<(), &'static str> {
+        for peer in &self.peers {
+            match self.connect_peer(peer) {
+                Ok(_) => println!("ok connect peer"),
+                Err(e) => println!("err connect peer: {}", e),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<BencodeItem> for Torrent {
@@ -246,13 +322,43 @@ impl TryFrom<BencodeItem> for Torrent {
         } else {
             return Err("info not a dict")
         }
-        let announce_url: String = match torrent_map.get("announce") {
-            Some(BencodeItem::String(s)) => match s.try_into() {
-                Ok(s) => s,
-                Err(_) => return Err("announce stringify err"),
-            },
-            Some(_) => return Err("announce not string"),
-            None => return Err("announce missing")
+        let announce_url_bs: &ByteString = if torrent_map.contains_key("announce-list") {
+            match torrent_map.get("announce-list") {
+                Some(BencodeItem::List(sx)) => {
+                    if sx.len() == 0 {
+                        return Err("announce-list empty")
+                    } else {
+                        match &sx[0] {
+                            BencodeItem::String(s) => s,
+                            BencodeItem::List(sx2) => {
+                                if sx2.len() == 0 {
+                                    return Err("announce-list 2 empty")
+                                } else {
+                                    match &sx2[0] {
+                                        BencodeItem::String(s2) => s2,
+                                        _ => return Err("announce-list[0][0] not String")
+                                    }
+                                }
+                            },
+                            _ => return Err("announce-list[0] not String")
+                        }
+                    }
+                },
+                Some(_) => return Err("announce-list not List"),
+                None => return Err("announce-list present but missing?"),
+            }
+        } else if torrent_map.contains_key("announce") {
+            match torrent_map.get("announce") {
+                Some(BencodeItem::String(s)) => s,
+                Some(_) => return Err("announce present but not String type"),
+                None => return Err("announce string present but missing?")
+            }
+        } else {
+            return Err("Missing announce or announce-list")
+        };
+        let announce_url: String = match announce_url_bs.try_into() {
+            Ok(s) => s,
+            Err(_) => return Err("announce_url_bs not string"),
         };
         let tracker_id = match torrent_map.get("trackerid") {
             Some(BencodeItem::String(s)) => match s.try_into() {
@@ -268,6 +374,12 @@ impl TryFrom<BencodeItem> for Torrent {
             None => return Err("missing pieces length")
         };
 
+        let pieces = match info_map.get(&"pieces".to_string()) {
+            Some(BencodeItem::String(bs)) => bs.bytes.clone(),
+            Some(_) => return Err("pieces not String"),
+            None => return Err("missing pieces"),
+        };
+
         // trackerid
         // interval
         // mininterval
@@ -275,6 +387,7 @@ impl TryFrom<BencodeItem> for Torrent {
         Ok(Torrent {
             trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
             pieces_length,
+            pieces,
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
@@ -311,11 +424,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("got peers:");
     println!("{:?}", torrent.peers);
 
-    for peer in &torrent.peers {
-        match peer.handshake(&torrent) {
-            Ok(_) => println!("shook hands!"),
-            Err(e) => println!("failed to shake hands: {}", e),
-        }
+    match torrent.connect() {
+        Ok(_) => println!("successfully finished with peer"),
+        Err(e) => println!("error communicating with peer: {}", e),
     }
 
     Ok(())
