@@ -1,4 +1,7 @@
-enum Message {
+use core::slice::Iter;
+
+#[derive(PartialEq, Debug)]
+pub enum Message {
     KeepAlive,
     Choke,
     Unchoke,
@@ -13,7 +16,49 @@ enum Message {
 }
 
 impl Message {
-    fn to_bytes(&self) -> Vec<u8> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Message, &'static str> {
+        let length = match bytes.get(0..4) {
+            Some(bx) => u32::from_be_bytes([bx[0], bx[1], bx[2], bx[3]]),
+            None => return Err("missing length bytes"),
+        };
+        let id_maybe = bytes.get(4);
+        match id_maybe {
+            Some(id) => {
+                match id {
+                    0 => Ok(Message::Choke),
+                    1 => Ok(Message::Unchoke),
+                    2 => Ok(Message::Interested),
+                    3 => Ok(Message::NotInterested),
+                    4 => { // Have
+                        match bytes.get(5..9) {
+                            Some(bx) => {
+                                Ok(Message::Have {
+                                    piece_index: u32::from_be_bytes([bx[0], bx[1], bx[2], bx[3]])
+                                })
+                            },
+                            None => return Err("Have message missing piece_index"),
+                        }
+                    },
+                    5 => { // Bitfield
+                        let bitfield_bytes = (length - 1) as usize; // err....
+                        match bytes.get(5..5+bitfield_bytes) {
+                            Some(bx) => Ok(Message::Bitfield { bitfield: bx.to_vec() }),
+                            None => return Err("Missing bitfield bytes"),
+                        }
+                    }
+                    _ => return Err("unknown message id")
+                }
+            },
+            None => {
+                if length > 0 {
+                    return Err("non-zero length but missing id byte")
+                }
+                return Ok(Message::KeepAlive)
+            },
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut bx = vec!();
         match self {
             Message::KeepAlive => {
@@ -30,7 +75,7 @@ impl Message {
                 bx.append(&mut self.get_length().to_be_bytes().to_vec());
                 bx.push(self.get_id().unwrap());
                 bx.append(&mut piece_index.to_be_bytes().to_vec());
-                // NB: to_be_bytes (be=big-endian) is the same as doing this:
+                // NB: to_be_bytes (be=big-endian) is roughly this:
                 // bx.push(((piece_index & 0xFF000000) >> 24) as u8);
                 // bx.push(((piece_index & 0x00FF0000) >> 16) as u8);
                 // bx.push(((piece_index & 0x0000FF00) >> 8) as u8);
@@ -91,26 +136,31 @@ mod tests {
     #[test]
     fn keepalive() {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x0), Message::KeepAlive.to_bytes());
+        assert_eq!(Message::KeepAlive, Message::from_bytes(&[0x0, 0x0, 0x0, 0x0]).expect(""))
     }
 
     #[test]
     fn choke() {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x1, 0x0), Message::Choke.to_bytes());
+        assert_eq!(Message::Choke, Message::from_bytes(&[0x0, 0x0, 0x0, 0x1, 0x0]).expect(""))
     }
 
     #[test]
     fn unchoke() {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x1, 0x1), Message::Unchoke.to_bytes());
+        assert_eq!(Message::Unchoke, Message::from_bytes(&[0x0, 0x0, 0x0, 0x1, 0x1]).expect(""))
     }
 
     #[test]
     fn interested() {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x1, 0x2), Message::Interested.to_bytes());
+        assert_eq!(Message::Interested, Message::from_bytes(&[0x0, 0x0, 0x0, 0x1, 0x2]).expect(""))
     }
 
     #[test]
     fn notinterested() {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x1, 0x3), Message::NotInterested.to_bytes());
+        assert_eq!(Message::NotInterested, Message::from_bytes(&[0x0, 0x0, 0x0, 0x1, 0x3]).expect(""))
     }
 
     #[test]
@@ -122,6 +172,14 @@ mod tests {
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x01, 0x0, 0x0), Message::Have { piece_index: 65536 }.to_bytes());
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x5, 0x4, 0x01, 0x00, 0x0, 0x0), Message::Have { piece_index: 16777216 }.to_bytes());
         assert_eq!(vec!(0x0, 0x0, 0x0, 0x5, 0x4, 0xff, 0xff, 0xff, 0xff), Message::Have { piece_index: 4294967295 }.to_bytes());
+
+        assert_eq!(Message::Have { piece_index: 0 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x0, 0x0, 0x0]).expect(""));
+        assert_eq!(Message::Have { piece_index: 1 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x0, 0x0, 0x1]).expect(""));
+        assert_eq!(Message::Have { piece_index: 255 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x0, 0x0, 0xFF]).expect(""));
+        assert_eq!(Message::Have { piece_index: 256 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x0, 0x01, 0x0]).expect(""));
+        assert_eq!(Message::Have { piece_index: 65536 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x0, 0x01, 0x0, 0x0]).expect(""));
+        assert_eq!(Message::Have { piece_index: 16777216 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0x01, 0x0, 0x0, 0x0]).expect(""));
+        assert_eq!(Message::Have { piece_index: 4294967295 }, Message::from_bytes(&[0x0, 0x0, 0x0, 0x5, 0x4, 0xff, 0xff, 0xff, 0xff]).expect(""));
     }
 
     #[test]

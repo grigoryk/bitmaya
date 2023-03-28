@@ -14,6 +14,8 @@ use std::str::from_utf8;
 
 mod message;
 
+use message::Message;
+
 const CLIENT_ID: &str = "-BM0010-123456789012";
 
 #[derive(Debug)]
@@ -240,13 +242,7 @@ impl Torrent {
             return Err("info_hashes do not match")
         }
 
-        let mut interested_message = vec!();
-        interested_message.push(0x0);
-        interested_message.push(0x0);
-        interested_message.push(0x0);
-        interested_message.push(0x1);
-        interested_message.append(&mut (String::from("2")).into_bytes());
-
+        let interested_message = Message::Interested.to_bytes();
         println!("sending interested message: {:x?}", interested_message);
         match stream.write(&interested_message) {
             Ok(b) => println!("wrote interested message, b={}", b),
@@ -262,24 +258,44 @@ impl Torrent {
             },
             Err(e) => println!("error reading bytes: {}", e),
         };
-        let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
-        let mut has_pieces = 0;
-        println!("there are {} pieces", num_of_pieces);
-        for i in 0..num_of_pieces {
-            println!("checking piece {}", i);
-            let nth = i % 8;
-            println!("bitmask {:08b}", 128 >> nth);
-            let byte_num = i / 8;
-            println!("byte number: {}", byte_num);
-            println!("{:b} & {:08b}", buff[5 + byte_num], 128 >> nth);
-            if buff[5 + byte_num] & 128 >> nth != 0 {
-                println!("has piece {}", i);
-                has_pieces += 1;
-            } else {
-                println!("missing piece {}", i);
-            }
+        let parsed = match Message::from_bytes(&buff) {
+            Ok(m) => m,
+            Err(e) => return Err(e),
+        };
+        println!("got message: {:?}", parsed);
+        match parsed {
+            Message::KeepAlive => todo!(),
+            Message::Choke => todo!(),
+            Message::Unchoke => todo!(),
+            Message::Interested => todo!(),
+            Message::NotInterested => todo!(),
+            Message::Have { piece_index } => todo!(),
+            Message::Bitfield { bitfield } => {
+                let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
+                let mut has_pieces = 0;
+                println!("there are {} pieces", num_of_pieces);
+                for i in 0..num_of_pieces {
+                    println!("checking piece {}", i);
+                    let nth = i % 8;
+                    println!("bitmask {:08b}", 128 >> nth);
+                    let byte_num = i / 8;
+                    println!("byte number: {}", byte_num);
+                    println!("{:b} & {:08b}", bitfield[byte_num], 128 >> nth);
+                    if bitfield[byte_num] & 128 >> nth != 0 {
+                        println!("has piece {}", i);
+                        has_pieces += 1;
+                    } else {
+                        println!("missing piece {}", i);
+                    }
+                }
+                println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
+            },
+            Message::Request { index, begin, length } => todo!(),
+            Message::Piece { index, begin, block } => todo!(),
+            Message::Cancel { index, begin, length } => todo!(),
+            Message::Port { listen_port } => todo!(),
         }
-        println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
+
 
         our_state = PeerState::ChokingInterested;
 
