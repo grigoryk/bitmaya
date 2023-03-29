@@ -300,7 +300,7 @@ impl Torrent {
                 }
             }
 
-            fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) {
+            fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> bool {
                 println!("verifying piece with index {}", index);
                 match self.pieces.get_mut(&index) {
                     Some(p) => {
@@ -308,7 +308,7 @@ impl Torrent {
                         println!("piece length = {}", piece.len());
                         if torrent_piece_length != piece.len() as u32 {
                             println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
-                            return;
+                            return false;
                         } else {
                             println!("torrent_piece_length matches piece len, verifying");
                         }
@@ -330,11 +330,16 @@ impl Torrent {
                         if expected_hash == piece_hash {
                             println!("hashes match. marking piece complete, index={}", index);
                             p.complete = true;
+                            true
                         } else {
-                            println!("hashes don't match")
+                            println!("hashes don't match");
+                            false
                         }
                     },
-                    None => println!("piece not found for index {}", index),
+                    None => {
+                        println!("piece not found for index {}", index);
+                        false
+                    }
                 }
             }
         }
@@ -346,8 +351,10 @@ impl Torrent {
         let mut block_index_in_progress: Option<PieceInProgress> = None;
         let mut skip_parsing = false;
         let mut read_zero_counter = 0;
+        let mut piece_completed_index: Option<u32> = None;
         loop {
             skip_parsing = false;
+            piece_completed_index = None;
             let mut buff = [0; 32768 * 2];
             let bytes_read = match stream.read(&mut buff) {
                 Ok(n) => {
@@ -374,7 +381,9 @@ impl Torrent {
                 Some(pi) => {
                     println!("piece in progress, appending...");
                     data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec());
-                    data.verify(pi.index, &self.pieces, self.pieces_length);
+                    if data.verify(pi.index, &self.pieces, self.pieces_length) {
+                        piece_completed_index = Some(pi.index);
+                    }
 
                     if bytes_read as u32 == pi.missing_bytes {
                         println!("got the rest of missing bytes!");
@@ -464,7 +473,9 @@ impl Torrent {
                             block_index_in_progress = None;
                         }
                         data.append(index, block);
-                        data.verify(index, &self.pieces, self.pieces_length);
+                        if data.verify(index, &self.pieces, self.pieces_length) {
+                            piece_completed_index = Some(index);
+                        }
                     },
                     Message::Cancel { index, begin, length } => {
                         println!("ignoring cancel msg - index={}, begin={}, length={}", index, begin, length)
@@ -484,6 +495,22 @@ impl Torrent {
 
             match their_state {
                 PeerState::NotChokingNotInterested | PeerState::NotChokingInterested => {
+                    match piece_completed_index {
+                        Some(pi) => {
+                            let have_msg = Message::Have { piece_index: pi };
+                            println!("sending have message: {}", have_msg);
+                            let have_msg = have_msg.to_bytes();
+                            match stream.write(&have_msg) {
+                                Ok(b) => println!("wrote have message, b={}", b),
+                                Err(e) => {
+                                    println!("err writing have message, {}", e);
+                                    stream.shutdown(Shutdown::Both).expect("shutdown");
+                                    return Err("err writing have")
+                                }
+                            }
+                        },
+                        None => {},
+                    }
                     match data.next_to_request() {
                         Some(rp) => {
                             println!("requesting piece part={:?}", rp);
