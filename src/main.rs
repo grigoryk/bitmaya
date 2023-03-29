@@ -1,4 +1,3 @@
-use std::hash::Hash;
 use std::time::Duration;
 use std::{env, collections::HashMap};
 use form_urlencoded::byte_serialize;
@@ -8,10 +7,9 @@ use std::error::Error;
 use std::io::{Read, Write};
 use url::Url;
 use std::net::{TcpStream, SocketAddr, Shutdown, IpAddr, Ipv4Addr};
-use rand::thread_rng;
-use rand::seq::SliceRandom;
 use std::fmt;
 use std::str::from_utf8;
+use std::fs;
 
 mod message;
 
@@ -64,6 +62,8 @@ struct Torrent {
     pieces: Vec<u8>,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
+    length: i64,
+    file_name: String,
 
     // our state
     uploaded: u32,
@@ -277,11 +277,39 @@ impl Torrent {
                 Data { pieces }
             }
 
+            fn to_bytes(self) -> Vec<u8> {
+                let mut pieces = vec!();
+                struct Piece {
+                    index: u32,
+                    data: Vec<u8>
+                }
+                for p in self.pieces.into_iter() {
+                    pieces.push(Piece { index: p.0, data: p.1.parts })
+                }
+                pieces.sort_by(|a, b| a.index.cmp(&b.index));
+                let mut bx = vec!();
+                for mut p in pieces {
+                    bx.append(&mut p.data);
+                }
+                bx
+            }
+
+            fn len(&self) -> usize {
+                let mut l = 0;
+                for p in self.pieces.values() {
+                    l += p.parts.len();
+                }
+                l
+            }
+
             fn next_to_request(&self) -> Option<RequestPart> {
+                println!("next_to_request, self.pieces.len={}", self.pieces.len());
                 for i in 0..self.pieces.len() {
+                    println!("checking piece {}", i);
                     if let Some(p) = self.pieces.get(&(i as u32)) {
+                        println!("got the piece, complete={}", p.complete);
                         if !p.complete {
-                            return Some(RequestPart { piece_index: i as u32, offset: p.parts.len() as u32 })
+                            return Some(RequestPart { piece_index: i as u32, offset: p.parts.len() as u32 });
                         }
                     }
                 }
@@ -306,9 +334,12 @@ impl Torrent {
                     Some(p) => {
                         let piece = &p.parts;
                         println!("piece length = {}", piece.len());
-                        if torrent_piece_length != piece.len() as u32 {
+                        let is_last_piece = (pieces_hashes.len() as u32 / 20 - 1) == index;
+                        if torrent_piece_length != piece.len() as u32 && !is_last_piece {
                             println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
                             return false;
+                        } else if is_last_piece {
+                            println!("is last piece, verifying");
                         } else {
                             println!("torrent_piece_length matches piece len, verifying");
                         }
@@ -343,7 +374,7 @@ impl Torrent {
                 }
             }
         }
-        let mut data = Data::new(self.pieces.len() as u32);
+        let mut data = Data::new(self.pieces.len() as u32 / 20);
         struct PieceInProgress {
             index: u32,
             missing_bytes: u32
@@ -445,7 +476,7 @@ impl Torrent {
                         let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
                         let mut has_pieces = 0;
                         println!("there are {} pieces", num_of_pieces);
-                        for i in 0..num_of_pieces {
+                        for i in 0..num_of_pieces - 1 {
                             println!("checking piece {}", i);
                             let nth = i % 8;
                             println!("bitmask {:08b}", 128 >> nth);
@@ -514,8 +545,17 @@ impl Torrent {
                     match data.next_to_request() {
                         Some(rp) => {
                             println!("requesting piece part={:?}", rp);
-                            let request_msg = Message::Request {
-                                index: rp.piece_index, begin: rp.offset, length: 16384 // 16kb
+                            let num_of_pieces = self.pieces.len() as u32 / 20;
+                            let request_msg = if rp.piece_index != (num_of_pieces - 1) {
+                                Message::Request {
+                                    index: rp.piece_index, begin: rp.offset, length: 16384 // 16kb
+                                }
+                            } else {
+                                // last piece
+                                let remaining_bytes = self.length as u32 - data.len() as u32;
+                                Message::Request {
+                                    index: rp.piece_index, begin: rp.offset, length: remaining_bytes
+                                }
                             };
                             println!("request_msg - {}", request_msg);
                             let request_msg = request_msg.to_bytes();
@@ -529,11 +569,22 @@ impl Torrent {
                                 }
                             }
                         },
-                        None => println!("nothing to request"),
+                        None => {
+                            println!("nothing to request. we're done!");
+                            stream.shutdown(Shutdown::Both).expect("shutdown");
+                            println!("torrent length={}, we have={}", self.length, data.len());
+                            println!("dumping to file {}", self.file_name);
+                            match fs::write(format!("/home/grisha/Code/bitmaya/{}", &self.file_name), data.to_bytes()) {
+                                Ok(_) => println!("wrote ok"),
+                                Err(e) => println!("err writing {}", e),
+                            }
+                            return Ok(())
+                        }
                     }
                 },
                 _ => println!("not requesting, they're choking us")
             }
+            println!("data len: {}", data.len());
         }
 
         Ok(())
@@ -632,6 +683,18 @@ impl TryFrom<BencodeItem> for Torrent {
             None => return Err("missing pieces"),
         };
 
+        let length = match info_map.get(&"length".to_string()) {
+            Some(BencodeItem::Int(i)) => *i,
+            Some(_) => return Err("length not int"),
+            None => return Err("missing length")
+        };
+
+        let file_name = match info_map.get(&"name".to_string()) {
+            Some(BencodeItem::String(bs)) => from_utf8(bs.bytes.as_slice()).unwrap().to_string(),
+            Some(_) => return Err("name not String"),
+            None => return Err("missing name")
+        };
+
         // trackerid
         // interval
         // mininterval
@@ -640,6 +703,8 @@ impl TryFrom<BencodeItem> for Torrent {
             trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
             pieces_length: pieces_length as u32, // overflow?
             pieces,
+            length,
+            file_name,
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
