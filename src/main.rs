@@ -1,3 +1,4 @@
+use std::hash::Hash;
 use std::time::Duration;
 use std::{env, collections::HashMap};
 use form_urlencoded::byte_serialize;
@@ -21,7 +22,7 @@ const CLIENT_ID: &str = "-BM0010-123456789012";
 #[derive(Debug)]
 enum PeerState {
     NotChokingNotInterested,
-    NotChokingInerested,
+    NotChokingInterested,
     ChokingNotInterested,
     ChokingInterested
 }
@@ -59,14 +60,15 @@ struct Tracker {
 #[derive(Debug)]
 struct Torrent {
     trackers: Vec<Tracker>,
-    pieces_length: i64,
+    pieces_length: u32,
     pieces: Vec<u8>,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
 
     // our state
-    uploaded: i64,
-    downloaded: i64,
+    uploaded: u32,
+    downloaded: u32,
+    data: Vec<u8>
 }
 
 impl fmt::Display for Torrent {
@@ -239,6 +241,7 @@ impl Torrent {
         println!("ours: {:?}, theirs: {:?}", info_hash_slice, other_info_hash_slice);
 
         if info_hash_slice != other_info_hash_slice {
+            stream.shutdown(Shutdown::Both).expect("shutdown");
             return Err("info_hashes do not match")
         }
 
@@ -246,60 +249,266 @@ impl Torrent {
         println!("sending interested message: {:x?}", interested_message);
         match stream.write(&interested_message) {
             Ok(b) => println!("wrote interested message, b={}", b),
-            Err(e) => println!("err writing interested message, {}", e),
+            Err(e) => {
+                println!("err writing interested message, {}", e);
+                stream.shutdown(Shutdown::Both).expect("shutdown");
+                return Err("err writing interested")
+            }
         }
-        let mut buff = [0; 100];
-        match stream.read(&mut buff) {
-            Ok(n) => {
-                println!("read {} bytes:", n);
-                for i in 0..n {
-                    println!("byte {}: {:b} - {}", i, buff[i], buff[i])
+        our_state = PeerState::ChokingInterested;
+        struct Piece {
+            complete: bool,
+            parts: Vec<u8>
+        }
+        struct Data {
+            pieces: HashMap<u32, Piece>
+        }
+        #[derive(Debug)]
+        struct RequestPart {
+            piece_index: u32,
+            offset: u32
+        }
+        impl Data {
+            fn new(num_pieces: u32) -> Data {
+                let mut pieces = HashMap::new();
+                for i in 0..num_pieces {
+                    pieces.insert(i, Piece { complete: false, parts: vec!() });
                 }
-            },
-            Err(e) => println!("error reading bytes: {}", e),
-        };
-        let parsed = match Message::from_bytes(&buff) {
-            Ok(m) => m,
-            Err(e) => return Err(e),
-        };
-        println!("got message: {:?}", parsed);
-        match parsed {
-            Message::KeepAlive => todo!(),
-            Message::Choke => todo!(),
-            Message::Unchoke => todo!(),
-            Message::Interested => todo!(),
-            Message::NotInterested => todo!(),
-            Message::Have { piece_index } => todo!(),
-            Message::Bitfield { bitfield } => {
-                let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
-                let mut has_pieces = 0;
-                println!("there are {} pieces", num_of_pieces);
-                for i in 0..num_of_pieces {
-                    println!("checking piece {}", i);
-                    let nth = i % 8;
-                    println!("bitmask {:08b}", 128 >> nth);
-                    let byte_num = i / 8;
-                    println!("byte number: {}", byte_num);
-                    println!("{:b} & {:08b}", bitfield[byte_num], 128 >> nth);
-                    if bitfield[byte_num] & 128 >> nth != 0 {
-                        println!("has piece {}", i);
-                        has_pieces += 1;
-                    } else {
-                        println!("missing piece {}", i);
+                Data { pieces }
+            }
+
+            fn next_to_request(&self) -> Option<RequestPart> {
+                for i in 0..self.pieces.len() {
+                    if let Some(p) = self.pieces.get(&(i as u32)) {
+                        if !p.complete {
+                            return Some(RequestPart { piece_index: i as u32, offset: p.parts.len() as u32 })
+                        }
                     }
                 }
-                println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
-            },
-            Message::Request { index, begin, length } => todo!(),
-            Message::Piece { index, begin, block } => todo!(),
-            Message::Cancel { index, begin, length } => todo!(),
-            Message::Port { listen_port } => todo!(),
+                return None
+            }
+
+            fn append(&mut self, index: u32, mut block: Vec<u8>) {
+                println!("appending block(len={}) to piece index={}", block.len(), index);
+                match self.pieces.get_mut(&index) {
+                    Some(p) => {
+                        println!("appending .. current size: {}, new bytes={}", p.parts.len(), block.len());
+                        p.parts.append(&mut block);
+                        println!("appended... new size: {}", p.parts.len());
+                    },
+                    None => println!("couldn't find piece index to append block! index={}", index),
+                }
+            }
+
+            fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) {
+                println!("verifying piece with index {}", index);
+                match self.pieces.get_mut(&index) {
+                    Some(p) => {
+                        let piece = &p.parts;
+                        println!("piece length = {}", piece.len());
+                        if torrent_piece_length != piece.len() as u32 {
+                            println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
+                            return;
+                        } else {
+                            println!("torrent_piece_length matches piece len, verifying");
+                        }
+                        println!("hash slice: {:?}", (index as usize)..(index as usize+20));
+                        let expected_hash = match pieces_hashes.get((index as usize) * 20..(index as usize) * 20 + 20) {
+                            Some(eh) => eh,
+                            None => panic!("couldn't find expected hash for: {:?}", (index as usize)..(index as usize+20)),
+                        };
+                        println!("hash length: {}", expected_hash.len());
+                        let mut hasher = Sha1::new();
+                        hasher.update(piece);
+                        let piece_hash: [u8; 20] = match hasher.finalize().try_into() {
+                            Ok(h) => h,
+                            Err(_) => panic!("failed to hash piece, should not happen"),
+                        };
+                        println!("comparing hashes:");
+                        println!("expected: {:?}", expected_hash);
+                        println!("piece:    {:?}", piece_hash);
+                        if expected_hash == piece_hash {
+                            println!("hashes match. marking piece complete, index={}", index);
+                            p.complete = true;
+                        } else {
+                            println!("hashes don't match")
+                        }
+                    },
+                    None => println!("piece not found for index {}", index),
+                }
+            }
+        }
+        let mut data = Data::new(self.pieces.len() as u32);
+        struct PieceInProgress {
+            index: u32,
+            missing_bytes: u32
+        }
+        let mut block_index_in_progress: Option<PieceInProgress> = None;
+        let mut skip_parsing = false;
+        let mut read_zero_counter = 0;
+        loop {
+            skip_parsing = false;
+            let mut buff = [0; 32768 * 2];
+            let bytes_read = match stream.read(&mut buff) {
+                Ok(n) => {
+                    println!("\n-- read {} bytes", n);
+                    n
+                    // for i in 0..n {
+                    //     println!("byte {}: {:b} - {}", i, buff[i], buff[i])
+                    // }
+                },
+                Err(e) => panic!("error reading bytes: {}", e),
+            };
+            if bytes_read == 0 {
+                read_zero_counter += 1;
+                println!("read_zero_counter = {}", read_zero_counter);
+                if read_zero_counter > 5 {
+                    println!("giving up");
+                    stream.shutdown(Shutdown::Both).expect("shutdown");
+                    break;
+                }
+                continue;
+            }
+            println!("first 20 bytes: {:x?}", buff.get(..20));
+            match &block_index_in_progress {
+                Some(pi) => {
+                    println!("piece in progress, appending...");
+                    data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec());
+                    data.verify(pi.index, &self.pieces, self.pieces_length);
+
+                    if bytes_read as u32 == pi.missing_bytes {
+                        println!("got the rest of missing bytes!");
+                        block_index_in_progress = None;
+                        skip_parsing = true;
+                    } else {
+                        println!("still have bytes missing");
+                        continue;
+                    }
+                },
+                None => println!("no piece in progress; parsing as regular message"),
+            }
+            if !skip_parsing {
+                let parsed = match Message::from_bytes(&buff, bytes_read as u32) {
+                    Ok(m) => m,
+                    Err(e) => return Err(e),
+                };
+                println!("got message: {}", parsed);
+                match parsed {
+                    Message::KeepAlive => {
+                        println!("ignoring keep-alive")
+                    },
+                    Message::Choke => {
+                        their_state = match their_state {
+                            PeerState::NotChokingNotInterested => PeerState::ChokingNotInterested,
+                            PeerState::NotChokingInterested => PeerState::ChokingInterested,
+                            PeerState::ChokingNotInterested => PeerState::ChokingNotInterested,
+                            PeerState::ChokingInterested => PeerState::ChokingInterested,
+                        }
+                    },
+                    Message::Unchoke => {
+                        their_state = match their_state {
+                            PeerState::NotChokingNotInterested => PeerState::NotChokingNotInterested,
+                            PeerState::NotChokingInterested => PeerState::NotChokingInterested,
+                            PeerState::ChokingNotInterested => PeerState::NotChokingNotInterested,
+                            PeerState::ChokingInterested => PeerState::NotChokingInterested,
+                        }
+                    },
+                    Message::Interested => {
+                        their_state = match their_state {
+                            PeerState::NotChokingNotInterested => PeerState::NotChokingInterested,
+                            PeerState::NotChokingInterested => PeerState::NotChokingInterested,
+                            PeerState::ChokingNotInterested => PeerState::ChokingInterested,
+                            PeerState::ChokingInterested => PeerState::ChokingInterested,
+                        }
+                    },
+                    Message::NotInterested => {
+                        their_state = match their_state {
+                            PeerState::NotChokingNotInterested => PeerState::NotChokingNotInterested,
+                            PeerState::NotChokingInterested => PeerState::NotChokingNotInterested,
+                            PeerState::ChokingNotInterested => PeerState::ChokingNotInterested,
+                            PeerState::ChokingInterested => PeerState::ChokingNotInterested,
+                        }
+                    },
+                    Message::Have { piece_index } => {
+                        println!("ignoring have msg - piece_index={}", piece_index)
+                    },
+                    Message::Bitfield { bitfield } => {
+                        let num_of_pieces = self.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
+                        let mut has_pieces = 0;
+                        println!("there are {} pieces", num_of_pieces);
+                        for i in 0..num_of_pieces {
+                            println!("checking piece {}", i);
+                            let nth = i % 8;
+                            println!("bitmask {:08b}", 128 >> nth);
+                            let byte_num = i / 8;
+                            println!("byte number: {}", byte_num);
+                            println!("{:b} & {:08b}", bitfield[byte_num], 128 >> nth);
+                            if bitfield[byte_num] & 128 >> nth != 0 {
+                                println!("has piece {}", i);
+                                has_pieces += 1;
+                            } else {
+                                println!("missing piece {}", i);
+                            }
+                        }
+                        println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
+                    },
+                    Message::Request { index, begin, length } => {
+                        println!("ignoring request msg - index={}, begin={}, length={}", index, begin, length)
+                    },
+                    Message::Piece { length, index, begin, block } => {
+                        if (length - 9) > block.len() as u32 {
+                            println!("piece message incomplete. expected length={}, got length={}, missing bytes={}", length - 9, block.len() as u32, length - 9 - block.len() as u32);
+                            block_index_in_progress = Some(PieceInProgress { index, missing_bytes: length - 9 - block.len() as u32 });
+                        } else {
+                            println!("piece message appears complete: length-9={}, block len={}", length - 9, block.len() as u32);
+                            block_index_in_progress = None;
+                        }
+                        data.append(index, block);
+                        data.verify(index, &self.pieces, self.pieces_length);
+                    },
+                    Message::Cancel { index, begin, length } => {
+                        println!("ignoring cancel msg - index={}, begin={}, length={}", index, begin, length)
+                    },
+                    Message::Port { listen_port } => {
+                        println!("ignoring port msg - port={}", listen_port)
+                    },
+                }
+            }
+
+            println!("our state: {:?}, their state: {:?}", our_state, their_state);
+
+            if block_index_in_progress.is_some() {
+                println!("Not sending follow-up message since piece in progress");
+                continue;
+            }
+
+            match their_state {
+                PeerState::NotChokingNotInterested | PeerState::NotChokingInterested => {
+                    match data.next_to_request() {
+                        Some(rp) => {
+                            println!("requesting piece part={:?}", rp);
+                            let request_msg = Message::Request {
+                                index: rp.piece_index, begin: rp.offset, length: 16384 // 16kb
+                            };
+                            println!("request_msg - {}", request_msg);
+                            let request_msg = request_msg.to_bytes();
+                            println!("sending request message: {:0x?}", request_msg);
+                            match stream.write(&request_msg) {
+                                Ok(b) => println!("wrote request message, b={}", b),
+                                Err(e) => {
+                                    println!("err writing request message, {}", e);
+                                    stream.shutdown(Shutdown::Both).expect("shutdown");
+                                    return Err("err writing requested")
+                                }
+                            }
+                        },
+                        None => println!("nothing to request"),
+                    }
+                },
+                _ => println!("not requesting, they're choking us")
+            }
         }
 
-
-        our_state = PeerState::ChokingInterested;
-
-        stream.shutdown(Shutdown::Both).expect("shutdown");
         Ok(())
     }
 
@@ -402,12 +611,13 @@ impl TryFrom<BencodeItem> for Torrent {
 
         Ok(Torrent {
             trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
-            pieces_length,
+            pieces_length: pieces_length as u32, // overflow?
             pieces,
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
-            downloaded: 0
+            downloaded: 0,
+            data: vec!()
         })
     }
 }
