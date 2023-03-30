@@ -56,6 +56,12 @@ struct Tracker {
 }
 
 #[derive(Debug)]
+struct File {
+    name: String,
+    length: i64
+}
+
+#[derive(Debug)]
 struct Torrent {
     trackers: Vec<Tracker>,
     pieces_length: u32,
@@ -63,7 +69,8 @@ struct Torrent {
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
     length: i64,
-    file_name: String,
+    name: String,
+    files: Vec<File>,
 
     // our state
     uploaded: u32,
@@ -76,6 +83,8 @@ impl fmt::Display for Torrent {
         writeln!(f, "Trackers: {:#?}", self.trackers)?;
         writeln!(f, "pieces length: {}", self.pieces_length)?;
         writeln!(f, "info hash: {}", self.info_hash())?;
+        writeln!(f, "name: {}", self.name)?;
+        writeln!(f, "files: {:?}", self.files)?;
         writeln!(f, "peers: {:#?}", self.peers)?;
         writeln!(f, "downloaded: {}", self.downloaded)?;
         writeln!(f, "uploaded: {}", self.uploaded)
@@ -573,11 +582,16 @@ impl Torrent {
                             println!("nothing to request. we're done!");
                             stream.shutdown(Shutdown::Both).expect("shutdown");
                             println!("torrent length={}, we have={}", self.length, data.len());
-                            println!("dumping to file {}", self.file_name);
-                            match fs::write(format!("/home/grisha/Code/bitmaya/{}", &self.file_name), data.to_bytes()) {
-                                Ok(_) => println!("wrote ok"),
-                                Err(e) => println!("err writing {}", e),
+                            if self.files.len() == 1 {
+                                println!("dumping to file {}", self.files[0].name);
+                                match fs::write(format!("/home/grisha/Code/bitmaya/{}", &self.files[0].name), data.to_bytes()) {
+                                    Ok(_) => println!("wrote ok"),
+                                    Err(e) => println!("err writing {}", e),
+                                }
+                            } else {
+                                todo!("don't know how to write to multiple files yet")
                             }
+
                             return Ok(())
                         }
                     }
@@ -684,15 +698,82 @@ impl TryFrom<BencodeItem> for Torrent {
         };
 
         let length = match info_map.get(&"length".to_string()) {
-            Some(BencodeItem::Int(i)) => *i,
+            Some(BencodeItem::Int(i)) => Some(*i),
             Some(_) => return Err("length not int"),
-            None => return Err("missing length")
+            None => {
+                println!("Missing length");
+                None
+            }
         };
 
-        let file_name = match info_map.get(&"name".to_string()) {
+        let files: Option<Vec<File>> = match info_map.get(&"files".to_string()) {
+            Some(BencodeItem::List(fx)) => {
+                let mut files = vec!();
+                for f in fx {
+                    let mut length: Option<i64> = None;
+                    let mut path: Option<String> = None;
+                    match f {
+                        BencodeItem::Dict(fd) => {
+                            for (k, v) in fd {
+                                if k.eq("length") {
+                                    match v {
+                                        BencodeItem::Int(i) => {
+                                            length = Some(*i);
+                                        },
+                                        _ => return Err("length part of files dict incorrect type")
+                                    }
+                                }
+                                if k.eq("path") {
+                                    match v {
+                                        BencodeItem::List(px) => {
+                                            if px.len() > 1 {
+                                                panic!("multiple paths")
+                                            }
+                                            match &px[0] {
+                                                BencodeItem::String(p) => {
+                                                    path = Some(from_utf8(p.bytes.as_slice()).unwrap().to_string());
+                                                },
+                                                _ => return Err("path part of files list incorrect type")
+
+                                            }
+                                        },
+                                        _ => return Err("path part of files list incorrect type"),
+                                    }
+                                }
+                            }
+                        },
+                        _ => return Err("files list item not dict")
+                    }
+                    match (length, path) {
+                        (Some(l), Some(p)) => files.push(File { length: l, name: p }),
+                        _ => return Err("failed to get length or path for a file")
+                    }
+                }
+                Some(files)
+            },
+            Some(_) => return Err("files not dict"),
+            None => None,
+        };
+
+        let name = match info_map.get(&"name".to_string()) {
             Some(BencodeItem::String(bs)) => from_utf8(bs.bytes.as_slice()).unwrap().to_string(),
             Some(_) => return Err("name not String"),
             None => return Err("missing name")
+        };
+
+        let (total_length, files) = match (length, files) {
+            (None, None) => return Err("no length or files"),
+            (None, Some(fx)) => {
+                let mut l = 0;
+                for f in &fx {
+                    l += f.length;
+                }
+                (l, fx)
+            },
+            (Some(l), None) => {
+                (l, vec!(File { name: name.clone(), length: l }))
+            },
+            (Some(_), Some(_)) => return Err("both length and files"),
         };
 
         // trackerid
@@ -703,8 +784,9 @@ impl TryFrom<BencodeItem> for Torrent {
             trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
             pieces_length: pieces_length as u32, // overflow?
             pieces,
-            length,
-            file_name,
+            name,
+            files,
+            length: total_length,
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
