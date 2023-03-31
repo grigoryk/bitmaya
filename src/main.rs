@@ -582,16 +582,17 @@ impl Torrent {
                             println!("nothing to request. we're done!");
                             stream.shutdown(Shutdown::Both).expect("shutdown");
                             println!("torrent length={}, we have={}", self.length, data.len());
-                            if self.files.len() == 1 {
-                                println!("dumping to file {}", self.files[0].name);
-                                match fs::write(format!("/home/grisha/Code/bitmaya/{}", &self.files[0].name), data.to_bytes()) {
-                                    Ok(_) => println!("wrote ok"),
+                            let bytes = data.to_bytes();
+                            let mut wrote = 0;
+                            for file in &self.files {
+                                println!("dumping to file {}", file.name);
+                                match fs::write(&file.name, bytes.get(wrote..file.length as usize).unwrap()) {
+                                    Ok(_) => {
+                                        wrote += file.length as usize;
+                                    },
                                     Err(e) => println!("err writing {}", e),
                                 }
-                            } else {
-                                todo!("don't know how to write to multiple files yet")
                             }
-
                             return Ok(())
                         }
                     }
