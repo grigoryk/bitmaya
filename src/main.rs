@@ -74,8 +74,7 @@ struct Torrent {
 
     // our state
     uploaded: u32,
-    downloaded: u32,
-    data: Vec<u8>
+    downloaded: u32
 }
 
 impl fmt::Display for Torrent {
@@ -389,9 +388,12 @@ impl Torrent {
             missing_bytes: u32
         }
         let mut block_index_in_progress: Option<PieceInProgress> = None;
-        let mut skip_parsing = false;
+        // after reading from the stream, if we determine that we just finished a block, send a "have" message.
+        // since we know that what we just read was part of an in-progress block, there's no need
+        // to parse that set of bytes as a message, so we "skip it".
+        let mut skip_parsing;
         let mut read_zero_counter = 0;
-        let mut piece_completed_index: Option<u32> = None;
+        let mut piece_completed_index: Option<u32>;
         loop {
             skip_parsing = false;
             piece_completed_index = None;
@@ -791,8 +793,7 @@ impl TryFrom<BencodeItem> for Torrent {
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
-            downloaded: 0,
-            data: vec!()
+            downloaded: 0
         })
     }
 }
@@ -819,6 +820,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut torrent: Torrent = bt.try_into()?;
     println!("Torrent:");
     println!("{}", torrent);
+
+    // how to write pieces to disk when just getting random parts?
+    // i guess we need to write into an intermediate form,
+    // and then write the real file once torrent is done
+    // and in the intermediate form, each piece is annotated with its index
 
     torrent.announce(5035)?;
 
