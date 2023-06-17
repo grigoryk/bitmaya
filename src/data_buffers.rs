@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use sha1::{Digest, Sha1};
 use std::fs;
 
-use crate::types::File;
+use crate::types::SizedFile;
 
 pub struct PieceInProgress {
     pub index: u32,
@@ -20,11 +20,41 @@ pub struct RequestPart {
     pub offset: u32
 }
 pub trait DataBuffer {
-    fn flush(self, files: &Vec<File>) -> Result<(), &'static str>;
+    fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str>;
     fn len(&self) -> usize;
     fn next_to_request(&self) -> Option<RequestPart>;
-    fn append(&mut self, index: u32, block: Vec<u8>);
-    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> bool;
+    fn append(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str>;
+    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str>;
+}
+
+pub struct PartsFileData {
+    name: String
+}
+impl PartsFileData {
+    pub fn new(name: String) -> PartsFileData {
+        PartsFileData { name }
+    }
+}
+impl DataBuffer for PartsFileData {
+    fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str> {
+        todo!()
+    }
+
+    fn len(&self) -> usize {
+        todo!()
+    }
+
+    fn next_to_request(&self) -> Option<RequestPart> {
+        todo!()
+    }
+
+    fn append(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str> {
+        todo!()
+    }
+
+    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str> {
+        todo!()
+    }
 }
 
 pub struct InMemoryData {
@@ -57,7 +87,7 @@ impl InMemoryData {
     }
 }
 impl DataBuffer for InMemoryData {
-    fn flush(self, files: &Vec<File>) -> Result<(), &'static str> {
+    fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str> {
         let bytes = self.to_bytes();
         let mut wrote = 0;
         for file in files {
@@ -97,19 +127,23 @@ impl DataBuffer for InMemoryData {
         return None
     }
 
-    fn append(&mut self, index: u32, mut block: Vec<u8>) {
+    fn append(&mut self, index: u32, mut block: Vec<u8>) -> Result<(), &'static str> {
         println!("appending block(len={}) to piece index={}", block.len(), index);
         match self.pieces.get_mut(&index) {
             Some(p) => {
                 println!("appending .. current size: {}, new bytes={}", p.parts.len(), block.len());
                 p.parts.append(&mut block);
                 println!("appended... new size: {}", p.parts.len());
+                Ok(())
             },
-            None => println!("couldn't find piece index to append block! index={}", index),
+            None => {
+                println!("couldn't find piece index to append block! index={}", index);
+                Err("couldn't find piece index to append block")
+            }
         }
     }
 
-    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> bool {
+    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str> {
         println!("verifying piece with index {}", index);
         match self.pieces.get_mut(&index) {
             Some(p) => {
@@ -118,7 +152,7 @@ impl DataBuffer for InMemoryData {
                 let is_last_piece = (pieces_hashes.len() as u32 / 20 - 1) == index;
                 if torrent_piece_length != piece.len() as u32 && !is_last_piece {
                     println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
-                    return false;
+                    return Ok(false);
                 } else if is_last_piece {
                     println!("is last piece, verifying");
                 } else {
@@ -142,15 +176,15 @@ impl DataBuffer for InMemoryData {
                 if expected_hash == piece_hash {
                     println!("hashes match. marking piece complete, index={}", index);
                     p.complete = true;
-                    true
+                    Ok(true)
                 } else {
                     println!("hashes don't match");
-                    false
+                    Ok(false)
                 }
             },
             None => {
                 println!("piece not found for index {}", index);
-                false
+                Ok(false)
             }
         }
     }

@@ -1,5 +1,5 @@
 #[derive(Debug)]
-pub struct File {
+pub struct SizedFile {
     pub name: String,
-    pub length: i64
+    pub length: u64
 }

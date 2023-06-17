@@ -67,9 +67,9 @@ struct Torrent {
     pieces: Vec<u8>,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
-    length: i64,
+    length: u64,
     name: String,
-    files: Vec<types::File>,
+    files: Vec<types::SizedFile>,
 
     // our state
     uploaded: u32,
@@ -302,7 +302,7 @@ impl Torrent {
                 Some(pi) => {
                     println!("piece in progress, appending...");
                     data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec());
-                    if data.verify(pi.index, &self.pieces, self.pieces_length) {
+                    if data.verify(pi.index, &self.pieces, self.pieces_length)? {
                         piece_completed_index = Some(pi.index);
                     }
 
@@ -393,8 +393,8 @@ impl Torrent {
                             println!("piece message appears complete: length-9={}, block len={}", length - 9, block.len() as u32);
                             block_index_in_progress = None;
                         }
-                        data.append(index, block);
-                        if data.verify(index, &self.pieces, self.pieces_length) {
+                        data.append(index, block)?;
+                        if data.verify(index, &self.pieces, self.pieces_length)? {
                             piece_completed_index = Some(index);
                         }
                     },
@@ -578,11 +578,11 @@ impl TryFrom<BencodeItem> for Torrent {
             }
         };
 
-        let files: Option<Vec<types::File>> = match info_map.get(&"files".to_string()) {
+        let files: Option<Vec<types::SizedFile>> = match info_map.get(&"files".to_string()) {
             Some(BencodeItem::List(fx)) => {
                 let mut files = vec!();
                 for f in fx {
-                    let mut length: Option<i64> = None;
+                    let mut length: Option<u64> = None;
                     let mut path: Option<String> = None;
                     match f {
                         BencodeItem::Dict(fd) => {
@@ -590,7 +590,7 @@ impl TryFrom<BencodeItem> for Torrent {
                                 if k.eq("length") {
                                     match v {
                                         BencodeItem::Int(i) => {
-                                            length = Some(*i);
+                                            length = Some(*i as u64);
                                         },
                                         _ => return Err("length part of files dict incorrect type")
                                     }
@@ -617,7 +617,7 @@ impl TryFrom<BencodeItem> for Torrent {
                         _ => return Err("files list item not dict")
                     }
                     match (length, path) {
-                        (Some(l), Some(p)) => files.push(types::File { length: l, name: p }),
+                        (Some(l), Some(p)) => files.push(types::SizedFile { length: l, name: p }),
                         _ => return Err("failed to get length or path for a file")
                     }
                 }
@@ -643,7 +643,7 @@ impl TryFrom<BencodeItem> for Torrent {
                 (l, fx)
             },
             (Some(l), None) => {
-                (l, vec!(types::File { name: name.clone(), length: l }))
+                (l as u64, vec!(types::SizedFile { name: name.clone(), length: l as u64 }))
             },
             (Some(_), Some(_)) => return Err("both length and files"),
         };
