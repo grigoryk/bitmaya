@@ -11,6 +11,7 @@ use std::fmt;
 use std::str::from_utf8;
 use std::fs;
 
+mod types;
 mod message;
 mod data_buffers;
 
@@ -60,12 +61,6 @@ struct Tracker {
 }
 
 #[derive(Debug)]
-struct File {
-    name: String,
-    length: i64
-}
-
-#[derive(Debug)]
 struct Torrent {
     trackers: Vec<Tracker>,
     pieces_length: u32,
@@ -74,7 +69,7 @@ struct Torrent {
     peers: Vec<Peer>,
     length: i64,
     name: String,
-    files: Vec<File>,
+    files: Vec<types::File>,
 
     // our state
     uploaded: u32,
@@ -269,7 +264,7 @@ impl Torrent {
         }
         our_state = PeerState::ChokingInterested;
 
-        let mut data = InMemoryData::new(self.pieces.len() as u32 / 20);
+        let mut data: InMemoryData = InMemoryData::new(self.pieces.len() as u32 / 20);
 
         let mut block_index_in_progress: Option<PieceInProgress> = None;
         // after reading from the stream, if we determine that we just finished a block, send a "have" message.
@@ -468,17 +463,7 @@ impl Torrent {
                             println!("nothing to request. we're done!");
                             stream.shutdown(Shutdown::Both).expect("shutdown");
                             println!("torrent length={}, we have={}", self.length, data.len());
-                            let bytes = data.to_bytes();
-                            let mut wrote = 0;
-                            for file in &self.files {
-                                println!("dumping to file {}", file.name);
-                                match fs::write(&file.name, bytes.get(wrote..file.length as usize).unwrap()) {
-                                    Ok(_) => {
-                                        wrote += file.length as usize;
-                                    },
-                                    Err(e) => println!("err writing {}", e),
-                                }
-                            }
+                            data.flush(&self.files)?;
                             return Ok(())
                         }
                     }
@@ -593,7 +578,7 @@ impl TryFrom<BencodeItem> for Torrent {
             }
         };
 
-        let files: Option<Vec<File>> = match info_map.get(&"files".to_string()) {
+        let files: Option<Vec<types::File>> = match info_map.get(&"files".to_string()) {
             Some(BencodeItem::List(fx)) => {
                 let mut files = vec!();
                 for f in fx {
@@ -632,7 +617,7 @@ impl TryFrom<BencodeItem> for Torrent {
                         _ => return Err("files list item not dict")
                     }
                     match (length, path) {
-                        (Some(l), Some(p)) => files.push(File { length: l, name: p }),
+                        (Some(l), Some(p)) => files.push(types::File { length: l, name: p }),
                         _ => return Err("failed to get length or path for a file")
                     }
                 }
@@ -658,7 +643,7 @@ impl TryFrom<BencodeItem> for Torrent {
                 (l, fx)
             },
             (Some(l), None) => {
-                (l, vec!(File { name: name.clone(), length: l }))
+                (l, vec!(types::File { name: name.clone(), length: l }))
             },
             (Some(_), Some(_)) => return Err("both length and files"),
         };

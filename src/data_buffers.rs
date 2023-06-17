@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use sha1::{Digest, Sha1};
+use std::fs;
+
+use crate::types::File;
 
 pub struct PieceInProgress {
     pub index: u32,
@@ -17,7 +20,7 @@ pub struct RequestPart {
     pub offset: u32
 }
 pub trait DataBuffer {
-    fn to_bytes(self) -> Vec<u8>;
+    fn flush(self, files: &Vec<File>) -> Result<(), &'static str>;
     fn len(&self) -> usize;
     fn next_to_request(&self) -> Option<RequestPart>;
     fn append(&mut self, index: u32, block: Vec<u8>);
@@ -35,8 +38,7 @@ impl InMemoryData {
         }
         InMemoryData { pieces }
     }
-}
-impl DataBuffer for InMemoryData {
+
     fn to_bytes(self) -> Vec<u8> {
         let mut pieces = vec!();
         struct Piece {
@@ -52,6 +54,25 @@ impl DataBuffer for InMemoryData {
             bx.append(&mut p.data);
         }
         bx
+    }
+}
+impl DataBuffer for InMemoryData {
+    fn flush(self, files: &Vec<File>) -> Result<(), &'static str> {
+        let bytes = self.to_bytes();
+        let mut wrote = 0;
+        for file in files {
+            println!("dumping to file {}", file.name);
+            match fs::write(&file.name, bytes.get(wrote..file.length as usize).unwrap()) {
+                Ok(_) => {
+                    wrote += file.length as usize;
+                },
+                Err(e) => {
+                    println!("error writing: {}", e);
+                    return Err("error writing")
+                }
+            }
+        }
+        Ok(())
     }
 
     fn len(&self) -> usize {
