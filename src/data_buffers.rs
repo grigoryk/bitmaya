@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::f32::consts::E;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::fs::File;
@@ -12,6 +13,17 @@ pub struct PieceInProgress {
 
 pub struct Piece {
     parts: Vec<u8>
+}
+
+impl Piece {
+    pub fn hash(&self) -> [u8; 20] {
+        let mut hasher = Sha1::new();
+        hasher.update(&self.parts);
+        match hasher.finalize().try_into() {
+            Ok(h) => h,
+            Err(e) => panic!("failed to hash piece, should not happen. error: {}", e),
+        }
+    }
 }
 
 pub struct PieceState {
@@ -35,9 +47,10 @@ pub struct RequestPart {
 pub trait DataBuffer {
     fn state(&self) -> &DownloadState;
     fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str>;
-    fn len(&self) -> usize;
-    fn append(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str>;
-    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str>;
+    fn total_byte_len(&self) -> usize;
+    fn append_to_piece(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str>;
+    fn get_piece(&self, index: u32) -> Option<&Piece>;
+    fn mark_piece_completed(&mut self, index: u32) -> Result<(), &'static str>;
 }
 
 pub trait DownloadStrategy {
@@ -85,15 +98,19 @@ impl DataBuffer for OnDiskData {
         todo!()
     }
 
-    fn len(&self) -> usize {
+    fn total_byte_len(&self) -> usize {
         todo!()
     }
 
-    fn append(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str> {
+    fn append_to_piece(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str> {
         todo!()
     }
 
-    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str> {
+    fn mark_piece_completed(&mut self, index: u32) -> Result<(), &'static str> {
+        todo!()
+    }
+
+    fn get_piece(&self, index: u32) -> Option<&Piece> {
         todo!()
     }
 }
@@ -153,7 +170,7 @@ impl DataBuffer for InMemoryData {
         Ok(())
     }
 
-    fn len(&self) -> usize {
+    fn total_byte_len(&self) -> usize {
         let mut l = 0;
         for p in self.pieces.values() {
             l += p.parts.len();
@@ -161,7 +178,7 @@ impl DataBuffer for InMemoryData {
         l
     }
 
-    fn append(&mut self, index: u32, mut block: Vec<u8>) -> Result<(), &'static str> {
+    fn append_to_piece(&mut self, index: u32, mut block: Vec<u8>) -> Result<(), &'static str> {
         let block_len = block.len() as u32;
         println!("appending block(len={}) to piece index={}", block.len(), index);
         match self.pieces.get_mut(&index) {
@@ -183,55 +200,17 @@ impl DataBuffer for InMemoryData {
         }
     }
 
-    fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str> {
-        println!("verifying piece with index {}", index);
-        match self.pieces.get_mut(&index) {
-            Some(p) => {
-                let piece = &p.parts;
-                println!("piece length = {}", piece.len());
-                let is_last_piece = (pieces_hashes.len() as u32 / 20 - 1) == index;
-                if piece.len() as u32 > torrent_piece_length && !is_last_piece {
-                    panic!("bug: piece length over defined torrent piece length: {} > {}", piece.len(), torrent_piece_length);
-                } else if torrent_piece_length != piece.len() as u32 && !is_last_piece {
-                    println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
-                    return Ok(false);
-                } else if is_last_piece {
-                    println!("is last piece, verifying");
-                } else {
-                    println!("torrent_piece_length matches piece len, verifying");
-                }
-                println!("hash slice: {:?}", (index as usize)..(index as usize+20));
-                let expected_hash = match pieces_hashes.get((index as usize) * 20..(index as usize) * 20 + 20) {
-                    Some(eh) => eh,
-                    None => panic!("couldn't find expected hash for: {:?}", (index as usize)..(index as usize+20)),
-                };
-                println!("hash length: {}", expected_hash.len());
-                let mut hasher = Sha1::new();
-                hasher.update(piece);
-                let piece_hash: [u8; 20] = match hasher.finalize().try_into() {
-                    Ok(h) => h,
-                    Err(_) => panic!("failed to hash piece, should not happen"),
-                };
-                println!("comparing hashes:");
-                println!("expected: {:?}", expected_hash);
-                println!("piece:    {:?}", piece_hash);
-                if expected_hash == piece_hash {
-                    println!("hashes match. marking piece complete, index={}", index);
-                    if let Some(piece_state) = self.state.pieces.get_mut(&index) {
-                        piece_state.complete = true;
-                    } else {
-                        panic!("download state not intact")
-                    }
-                    Ok(true)
-                } else {
-                    println!("hashes don't match");
-                    Ok(false)
-                }
-            },
-            None => {
-                println!("piece not found for index {}", index);
-                Ok(false)
-            }
+    fn mark_piece_completed(&mut self, index: u32) -> Result<(), &'static str> {
+        println!("marking piece={} as completed", index);
+        if let Some(piece_state) = self.state.pieces.get_mut(&index) {
+            piece_state.complete = true;
+            Ok(())
+        } else {
+            Err("mark_piece_completed: no such index")
         }
+    }
+
+    fn get_piece(&self, index: u32) -> Option<&Piece> {
+        return self.pieces.get(&index);
     }
 }

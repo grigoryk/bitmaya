@@ -60,10 +60,29 @@ struct Tracker {
 }
 
 #[derive(Debug)]
+struct AllHashes {
+    hashes: Vec<u8>
+}
+impl AllHashes {
+    fn new(hashes: Vec<u8>) -> AllHashes {
+        AllHashes { hashes: hashes }
+    }
+    fn len(&self) -> usize {
+        self.hashes.len()
+    }
+    fn hash_for_index(&self, index: u32) -> &[u8] {
+        match self.hashes.get((index as usize) * 20..(index as usize) * 20 + 20) {
+            Some(eh) => eh,
+            None => panic!("couldn't find expected hash for: {:?}", (index as usize)..(index as usize+20)),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Torrent {
     trackers: Vec<Tracker>,
     pieces_length: u32,
-    pieces: Vec<u8>,
+    pieces: AllHashes,
     info_bytes: Vec<u8>,
     peers: Vec<Peer>,
     length: u64,
@@ -301,15 +320,18 @@ impl Torrent {
             match &block_index_in_progress {
                 Some(pi) => {
                     println!("piece in progress, appending...");
-                    data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec())?;
-                    if data.verify(pi.index, &self.pieces, self.pieces_length)? {
-                        piece_completed_index = Some(pi.index);
-                    }
+                    data.append_to_piece(pi.index, buff.get(0..bytes_read).unwrap().to_vec())?;
 
                     if bytes_read as u32 == pi.missing_bytes {
                         println!("got the rest of missing bytes!");
+                        if self.pieces.hash_for_index(pi.index) == data.get_piece(pi.index).unwrap().hash() {
+                            data.mark_piece_completed(pi.index)?;
+                            piece_completed_index = Some(pi.index);
+                        }
+
                         block_index_in_progress = None;
                         skip_parsing = true;
+
                     } else {
                         println!("still have bytes missing");
                         continue;
@@ -387,14 +409,16 @@ impl Torrent {
                     },
                     Message::Piece { length, index, begin, block } => {
                         let block_len = block.len() as u32;
-                        data.append(index, block)?;
+                        data.append_to_piece(index, block)?;
                         // 9 = size of piece message minus the block bytes
                         if (length - 9) > block_len {
                             println!("piece message incomplete. expected length={}, got length={}, missing bytes={}", length - 9, block_len, length - 9 - block_len);
                             block_index_in_progress = Some(PieceInProgress { index, missing_bytes: length - 9 - block_len });
                         } else {
                             println!("piece message appears complete: length-9={}, block len={}", length - 9, block_len);
-                            if data.verify(index, &self.pieces, self.pieces_length)? {
+
+                            if self.pieces.hash_for_index(index) == data.get_piece(index).unwrap().hash() {
+                                data.mark_piece_completed(index);
                                 piece_completed_index = Some(index);
                                 println!("piece completed at index={}", index);
                             }
@@ -445,7 +469,7 @@ impl Torrent {
                                 }
                             } else {
                                 // last piece
-                                let remaining_bytes = self.length as u32 - data.len() as u32;
+                                let remaining_bytes = self.length as u32 - data.total_byte_len() as u32;
                                 Message::Request {
                                     index: rp.piece_index, begin: rp.offset, length: remaining_bytes
                                 }
@@ -465,7 +489,7 @@ impl Torrent {
                         None => {
                             println!("nothing to request. we're done!");
                             stream.shutdown(Shutdown::Both).expect("shutdown");
-                            println!("torrent length={}, we have={}", self.length, data.len());
+                            println!("torrent length={}, we have={}", self.length, data.total_byte_len());
                             data.flush(&self.files)?;
                             return Ok(())
                         }
@@ -473,7 +497,7 @@ impl Torrent {
                 },
                 _ => println!("not requesting, they're choking us")
             }
-            println!("data len: {}", data.len());
+            println!("data len: {}", data.total_byte_len());
         }
 
         Ok(())
@@ -658,7 +682,7 @@ impl TryFrom<BencodeItem> for Torrent {
         Ok(Torrent {
             trackers: vec!(Tracker { announce_url, tracker_id, interval: None, min_interval: None }),
             pieces_length: pieces_length as u32, // overflow?
-            pieces,
+            pieces: AllHashes::new(pieces),
             name,
             files,
             length: total_length,
