@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::fs::File;
 
 use crate::types::SizedFile;
 
@@ -10,8 +11,20 @@ pub struct PieceInProgress {
 }
 
 pub struct Piece {
-    complete: bool,
     parts: Vec<u8>
+}
+
+pub struct PieceState {
+    complete: bool,
+    parts_offset: u32
+}
+
+// common state of a buffer is:
+// - list of pieces
+// - is piece complete
+// - piece parts offset for each piece
+pub struct DownloadState {
+    pieces: HashMap<u32, PieceState>
 }
 
 #[derive(Debug)]
@@ -20,31 +33,59 @@ pub struct RequestPart {
     pub offset: u32
 }
 pub trait DataBuffer {
+    fn state(&self) -> &DownloadState;
     fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str>;
     fn len(&self) -> usize;
-    fn next_to_request(&self) -> Option<RequestPart>;
     fn append(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str>;
     fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str>;
 }
 
+pub trait DownloadAlgorithm {
+    fn next_to_request(&self, buffer: &impl DataBuffer) -> Option<RequestPart>;
+}
+
+pub struct SequentialDownload {}
+impl DownloadAlgorithm for SequentialDownload {
+    fn next_to_request(&self, buffer: &impl DataBuffer) -> Option<RequestPart> {
+        let pieces = &buffer.state().pieces;
+        for i in 0..pieces.len() {
+            println!("checking piece {}", i);
+            if let Some(p) = pieces.get(&(i as u32)) {
+                println!("got the piece, complete={}", p.complete);
+                if !p.complete {
+                    return Some(RequestPart { piece_index: i as u32, offset: p.parts_offset });
+                }
+            }
+        }
+        return None
+    }
+}
+
 pub struct PartsFileData {
-    name: String
+    file: File
+
+    // we'll get blocks belonging to random pieces
+    // we know number of pieces (and length of each piece)
+    // so for each block we know where to write_at(block_index+block_written_so_far_offset)
+    // each parts file must "stand on its own" - should be able to restore its state, e.g.
+    // so a naive implementation may be:
+    //
 }
 impl PartsFileData {
-    pub fn new(name: String) -> PartsFileData {
-        PartsFileData { name }
+    pub fn new(name: String, num_pieces: u32) -> std::io::Result<PartsFileData> {
+        Ok(PartsFileData { file: File::open(name)? })
     }
 }
 impl DataBuffer for PartsFileData {
+    fn state(&self) -> &DownloadState {
+        todo!()
+    }
+
     fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str> {
         todo!()
     }
 
     fn len(&self) -> usize {
-        todo!()
-    }
-
-    fn next_to_request(&self) -> Option<RequestPart> {
         todo!()
     }
 
@@ -58,15 +99,18 @@ impl DataBuffer for PartsFileData {
 }
 
 pub struct InMemoryData {
+    state: DownloadState,
     pieces: HashMap<u32, Piece>
 }
 impl InMemoryData {
     pub fn new(num_pieces: u32) -> InMemoryData {
         let mut pieces = HashMap::new();
+        let mut state = HashMap::new();
         for i in 0..num_pieces {
-            pieces.insert(i, Piece { complete: false, parts: vec!() });
+            pieces.insert(i, Piece { parts: vec!() });
+            state.insert(i, PieceState { complete: false, parts_offset: 0 });
         }
-        InMemoryData { pieces }
+        InMemoryData { state: DownloadState { pieces: state }, pieces }
     }
 
     fn to_bytes(self) -> Vec<u8> {
@@ -87,6 +131,10 @@ impl InMemoryData {
     }
 }
 impl DataBuffer for InMemoryData {
+    fn state(&self) -> &DownloadState {
+        &self.state
+    }
+
     fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str> {
         let bytes = self.to_bytes();
         let mut wrote = 0;
@@ -113,26 +161,17 @@ impl DataBuffer for InMemoryData {
         l
     }
 
-    fn next_to_request(&self) -> Option<RequestPart> {
-        println!("next_to_request, self.pieces.len={}", self.pieces.len());
-        for i in 0..self.pieces.len() {
-            println!("checking piece {}", i);
-            if let Some(p) = self.pieces.get(&(i as u32)) {
-                println!("got the piece, complete={}", p.complete);
-                if !p.complete {
-                    return Some(RequestPart { piece_index: i as u32, offset: p.parts.len() as u32 });
-                }
-            }
-        }
-        return None
-    }
-
     fn append(&mut self, index: u32, mut block: Vec<u8>) -> Result<(), &'static str> {
         println!("appending block(len={}) to piece index={}", block.len(), index);
         match self.pieces.get_mut(&index) {
             Some(p) => {
                 println!("appending .. current size: {}, new bytes={}", p.parts.len(), block.len());
                 p.parts.append(&mut block);
+                if let Some(piece_state) = self.state.pieces.get_mut(&index) {
+                    piece_state.parts_offset += block.len() as u32;
+                } else {
+                    panic!("download state not intact")
+                };
                 println!("appended... new size: {}", p.parts.len());
                 Ok(())
             },
@@ -175,7 +214,11 @@ impl DataBuffer for InMemoryData {
                 println!("piece:    {:?}", piece_hash);
                 if expected_hash == piece_hash {
                     println!("hashes match. marking piece complete, index={}", index);
-                    p.complete = true;
+                    if let Some(piece_state) = self.state.pieces.get_mut(&index) {
+                        piece_state.complete = true;
+                    } else {
+                        panic!("download state not intact")
+                    }
                     Ok(true)
                 } else {
                     println!("hashes don't match");

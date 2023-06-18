@@ -16,7 +16,7 @@ mod message;
 mod data_buffers;
 
 use crate::message::Message;
-use crate::data_buffers::{DataBuffer, InMemoryData};
+use crate::data_buffers::{DataBuffer, InMemoryData, SequentialDownload, DownloadAlgorithm};
 
 use crate::data_buffers::PieceInProgress;
 
@@ -182,6 +182,7 @@ impl Torrent {
     fn connect_peer(&self, peer: &Peer) -> Result<(), &'static str> {
         let mut our_state = PeerState::ChokingNotInterested;
         let mut their_state = PeerState::ChokingNotInterested;
+        let download_algorithm = SequentialDownload {};
 
         let ip = IpAddr::V4(Ipv4Addr::new(peer.addr[0], peer.addr[1], peer.addr[2], peer.addr[3]));
         let port = ((peer.addr[4] as u16) << 8) | peer.addr[5] as u16;
@@ -432,7 +433,7 @@ impl Torrent {
                         },
                         None => {},
                     }
-                    match data.next_to_request() {
+                    match download_algorithm.next_to_request(&data) {
                         Some(rp) => {
                             println!("requesting piece part={:?}", rp);
                             let num_of_pieces = self.pieces.len() as u32 / 20;
