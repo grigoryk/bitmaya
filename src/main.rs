@@ -9,7 +9,6 @@ use url::Url;
 use std::net::{TcpStream, SocketAddr, Shutdown, IpAddr, Ipv4Addr};
 use std::fmt;
 use std::str::from_utf8;
-use std::fs;
 
 mod types;
 mod message;
@@ -302,7 +301,7 @@ impl Torrent {
             match &block_index_in_progress {
                 Some(pi) => {
                     println!("piece in progress, appending...");
-                    data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec());
+                    data.append(pi.index, buff.get(0..bytes_read).unwrap().to_vec())?;
                     if data.verify(pi.index, &self.pieces, self.pieces_length)? {
                         piece_completed_index = Some(pi.index);
                     }
@@ -387,16 +386,19 @@ impl Torrent {
                         println!("ignoring request msg - index={}, begin={}, length={}", index, begin, length)
                     },
                     Message::Piece { length, index, begin, block } => {
-                        if (length - 9) > block.len() as u32 {
-                            println!("piece message incomplete. expected length={}, got length={}, missing bytes={}", length - 9, block.len() as u32, length - 9 - block.len() as u32);
-                            block_index_in_progress = Some(PieceInProgress { index, missing_bytes: length - 9 - block.len() as u32 });
-                        } else {
-                            println!("piece message appears complete: length-9={}, block len={}", length - 9, block.len() as u32);
-                            block_index_in_progress = None;
-                        }
+                        let block_len = block.len() as u32;
                         data.append(index, block)?;
-                        if data.verify(index, &self.pieces, self.pieces_length)? {
-                            piece_completed_index = Some(index);
+                        // 9 = size of piece message minus the block bytes
+                        if (length - 9) > block_len {
+                            println!("piece message incomplete. expected length={}, got length={}, missing bytes={}", length - 9, block_len, length - 9 - block_len);
+                            block_index_in_progress = Some(PieceInProgress { index, missing_bytes: length - 9 - block_len });
+                        } else {
+                            println!("piece message appears complete: length-9={}, block len={}", length - 9, block_len);
+                            if data.verify(index, &self.pieces, self.pieces_length)? {
+                                piece_completed_index = Some(index);
+                                println!("piece completed at index={}", index);
+                            }
+                            block_index_in_progress = None;
                         }
                     },
                     Message::Cancel { index, begin, length } => {

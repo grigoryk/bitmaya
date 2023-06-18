@@ -162,13 +162,14 @@ impl DataBuffer for InMemoryData {
     }
 
     fn append(&mut self, index: u32, mut block: Vec<u8>) -> Result<(), &'static str> {
+        let block_len = block.len() as u32;
         println!("appending block(len={}) to piece index={}", block.len(), index);
         match self.pieces.get_mut(&index) {
             Some(p) => {
-                println!("appending .. current size: {}, new bytes={}", p.parts.len(), block.len());
+                println!("appending .. current size: {}, new bytes={}", p.parts.len(), block_len);
                 p.parts.append(&mut block);
                 if let Some(piece_state) = self.state.pieces.get_mut(&index) {
-                    piece_state.parts_offset += block.len() as u32;
+                    piece_state.parts_offset += block_len;
                 } else {
                     panic!("download state not intact")
                 };
@@ -189,7 +190,9 @@ impl DataBuffer for InMemoryData {
                 let piece = &p.parts;
                 println!("piece length = {}", piece.len());
                 let is_last_piece = (pieces_hashes.len() as u32 / 20 - 1) == index;
-                if torrent_piece_length != piece.len() as u32 && !is_last_piece {
+                if piece.len() as u32 > torrent_piece_length && !is_last_piece {
+                    panic!("bug: piece length over defined torrent piece length: {} > {}", piece.len(), torrent_piece_length);
+                } else if torrent_piece_length != piece.len() as u32 && !is_last_piece {
                     println!("torrent_piece_length = {}, piece len = {}, don't match, not verifying", torrent_piece_length, piece.len());
                     return Ok(false);
                 } else if is_last_piece {
