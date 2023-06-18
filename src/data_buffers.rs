@@ -40,12 +40,12 @@ pub trait DataBuffer {
     fn verify(&mut self, index: u32, pieces_hashes: &Vec<u8>, torrent_piece_length: u32) -> Result<bool, &'static str>;
 }
 
-pub trait DownloadAlgorithm {
+pub trait DownloadStrategy {
     fn next_to_request(&self, buffer: &impl DataBuffer) -> Option<RequestPart>;
 }
 
-pub struct SequentialDownload {}
-impl DownloadAlgorithm for SequentialDownload {
+pub struct SequentialDownload;
+impl DownloadStrategy for SequentialDownload {
     fn next_to_request(&self, buffer: &impl DataBuffer) -> Option<RequestPart> {
         let pieces = &buffer.state().pieces;
         for i in 0..pieces.len() {
@@ -61,7 +61,7 @@ impl DownloadAlgorithm for SequentialDownload {
     }
 }
 
-pub struct PartsFileData {
+pub struct OnDiskData {
     file: File
 
     // we'll get blocks belonging to random pieces
@@ -71,12 +71,12 @@ pub struct PartsFileData {
     // so a naive implementation may be:
     //
 }
-impl PartsFileData {
-    pub fn new(name: String, num_pieces: u32) -> std::io::Result<PartsFileData> {
-        Ok(PartsFileData { file: File::open(name)? })
+impl OnDiskData {
+    pub fn new(name: String, num_pieces: u32) -> std::io::Result<OnDiskData> {
+        Ok(OnDiskData { file: File::open(name)? })
     }
 }
-impl DataBuffer for PartsFileData {
+impl DataBuffer for OnDiskData {
     fn state(&self) -> &DownloadState {
         todo!()
     }

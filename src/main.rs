@@ -15,7 +15,7 @@ mod message;
 mod data_buffers;
 
 use crate::message::Message;
-use crate::data_buffers::{DataBuffer, InMemoryData, SequentialDownload, DownloadAlgorithm};
+use crate::data_buffers::{DataBuffer, InMemoryData, SequentialDownload, DownloadStrategy};
 
 use crate::data_buffers::PieceInProgress;
 
