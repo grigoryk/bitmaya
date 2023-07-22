@@ -11,11 +11,12 @@ use std::fmt;
 use std::str::from_utf8;
 
 mod types;
+mod serialization;
 mod message;
 mod data_buffers;
 
 use crate::message::Message;
-use crate::data_buffers::{DataBuffer, InMemoryData, SequentialDownload, DownloadStrategy};
+use crate::data_buffers::{DataBuffer, InMemoryData, SequentialDownload, DownloadStrategy, OnDiskData};
 
 use crate::data_buffers::PieceInProgress;
 
@@ -283,7 +284,7 @@ impl Torrent {
         }
         our_state = PeerState::ChokingInterested;
 
-        let mut data: InMemoryData = InMemoryData::new(self.pieces.len() as u32 / 20);
+        let mut data = OnDiskData::new(String::from("parts"), self.pieces.len() as u32 / 20).unwrap();
 
         let mut block_index_in_progress: Option<PieceInProgress> = None;
         // after reading from the stream, if we determine that we just finished a block, send a "have" message.

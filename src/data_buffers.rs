@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::f32::consts::E;
+use std::{collections::HashMap, fs::OpenOptions};
+use std::os::unix::prelude::FileExt;
+use mescal::{BencodeItem, AsBencodeBytes};
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::fs::File;
 
-use crate::types::SizedFile;
+use crate::types::{SizedFile, DownloadState, PieceState};
 
 pub struct PieceInProgress {
     pub index: u32,
@@ -24,19 +25,6 @@ impl Piece {
             Err(e) => panic!("failed to hash piece, should not happen. error: {}", e),
         }
     }
-}
-
-pub struct PieceState {
-    complete: bool,
-    parts_offset: u32
-}
-
-// common state of a buffer is:
-// - list of pieces
-// - is piece complete
-// - piece parts offset for each piece
-pub struct DownloadState {
-    pieces: HashMap<u32, PieceState>
 }
 
 #[derive(Debug)]
@@ -63,7 +51,7 @@ impl DownloadStrategy for SequentialDownload {
         let pieces = &buffer.state().pieces;
         for i in 0..pieces.len() {
             println!("checking piece {}", i);
-            if let Some(p) = pieces.get(&(i as u32)) {
+            if let Some(p) = pieces.get(i) {
                 println!("got the piece, complete={}", p.complete);
                 if !p.complete {
                     return Some(RequestPart { piece_index: i as u32, offset: p.parts_offset });
@@ -75,7 +63,9 @@ impl DownloadStrategy for SequentialDownload {
 }
 
 pub struct OnDiskData {
-    file: File
+    state: DownloadState,
+    file: File,
+    current_state_size: usize,
 
     // we'll get blocks belonging to random pieces
     // we know number of pieces (and length of each piece)
@@ -86,12 +76,31 @@ pub struct OnDiskData {
 }
 impl OnDiskData {
     pub fn new(name: String, num_pieces: u32) -> std::io::Result<OnDiskData> {
-        Ok(OnDiskData { file: File::open(name)? })
+        let mut state = vec!();
+        for _ in 0..num_pieces {
+            state.push(PieceState { complete: false, parts_offset: 0 });
+        }
+        let file = OpenOptions::new().write(true).create(true).open(name)?;
+        let state = DownloadState { pieces: state };
+        let constant_state_size = OnDiskData::persist_state_static(&file, &state)?;
+        Ok(OnDiskData { file, state, current_state_size: constant_state_size })
+    }
+
+    fn persist_state(&mut self) {
+        match OnDiskData::persist_state_static(&self.file, &self.state) {
+            Ok(written) => self.current_state_size = written,
+            Err(_) => panic!("couldn't persist state"),
+        }
+    }
+
+    fn persist_state_static(file: &File, state: &DownloadState) -> Result<usize, std::io::Error> {
+        let state = BencodeItem::from(state);
+        file.write_at(&state.as_bytes(), 0)
     }
 }
 impl DataBuffer for OnDiskData {
     fn state(&self) -> &DownloadState {
-        todo!()
+        &self.state
     }
 
     fn flush(self, files: &Vec<SizedFile>) -> Result<(), &'static str> {
@@ -99,15 +108,32 @@ impl DataBuffer for OnDiskData {
     }
 
     fn total_byte_len(&self) -> usize {
-        todo!()
+        let mut pieces = 0;
+        for piece in &self.state.pieces {
+            pieces = pieces + piece.parts_offset;
+        }
+        self.current_state_size + pieces as usize
     }
 
     fn append_to_piece(&mut self, index: u32, block: Vec<u8>) -> Result<(), &'static str> {
-        todo!()
+        if let Some(piece_state) = self.state.pieces.get_mut(index as usize) {
+            piece_state.parts_offset += block.len() as u32;
+        } else {
+            panic!("download state not intact")
+        };
+        // todo write to disk
+        self.persist_state();
+        Ok(())
     }
 
     fn mark_piece_completed(&mut self, index: u32) -> Result<(), &'static str> {
-        todo!()
+        if let Some(piece_state) = self.state.pieces.get_mut(index as usize) {
+            piece_state.complete = true;
+            self.persist_state();
+            Ok(())
+        } else {
+            Err("mark_piece_completed: no such index")
+        }
     }
 
     fn get_piece(&self, index: u32) -> Option<&Piece> {
@@ -122,10 +148,10 @@ pub struct InMemoryData {
 impl InMemoryData {
     pub fn new(num_pieces: u32) -> InMemoryData {
         let mut pieces = HashMap::new();
-        let mut state = HashMap::new();
+        let mut state = vec!();
         for i in 0..num_pieces {
             pieces.insert(i, Piece { parts: vec!() });
-            state.insert(i, PieceState { complete: false, parts_offset: 0 });
+            state.push(PieceState { complete: false, parts_offset: 0 });
         }
         InMemoryData { state: DownloadState { pieces: state }, pieces }
     }
@@ -185,7 +211,7 @@ impl DataBuffer for InMemoryData {
             Some(p) => {
                 println!("appending .. current size: {}, new bytes={}", p.parts.len(), block_len);
                 p.parts.append(&mut block);
-                if let Some(piece_state) = self.state.pieces.get_mut(&index) {
+                if let Some(piece_state) = self.state.pieces.get_mut(index as usize) {
                     piece_state.parts_offset += block_len;
                 } else {
                     panic!("download state not intact")
@@ -202,7 +228,7 @@ impl DataBuffer for InMemoryData {
 
     fn mark_piece_completed(&mut self, index: u32) -> Result<(), &'static str> {
         println!("marking piece={} as completed", index);
-        if let Some(piece_state) = self.state.pieces.get_mut(&index) {
+        if let Some(piece_state) = self.state.pieces.get_mut(index as usize) {
             piece_state.complete = true;
             Ok(())
         } else {
