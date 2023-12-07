@@ -284,7 +284,7 @@ impl Torrent {
         }
         our_state = PeerState::ChokingInterested;
 
-        let mut data = OnDiskData::new(String::from("parts"), self.pieces.len() as u32 / 20).unwrap();
+        let mut data = InMemoryData::new(self.pieces.len() as u32 / 20);
 
         let mut block_index_in_progress: Option<PieceInProgress> = None;
         // after reading from the stream, if we determine that we just finished a block, send a "have" message.
@@ -419,7 +419,7 @@ impl Torrent {
                             println!("piece message appears complete: length-9={}, block len={}", length - 9, block_len);
 
                             if self.pieces.hash_for_index(index) == data.get_piece(index).unwrap().hash() {
-                                data.mark_piece_completed(index);
+                                data.mark_piece_completed(index)?;
                                 piece_completed_index = Some(index);
                                 println!("piece completed at index={}", index);
                             }

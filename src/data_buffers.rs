@@ -162,8 +162,8 @@ impl InMemoryData {
             index: u32,
             data: Vec<u8>
         }
-        for p in self.pieces.into_iter() {
-            pieces.push(Piece { index: p.0, data: p.1.parts })
+        for (piece_index, piece_data) in self.pieces.into_iter() {
+            pieces.push(Piece { index: piece_index, data: piece_data.parts })
         }
         pieces.sort_by(|a, b| a.index.cmp(&b.index));
         let mut bx = vec!();
