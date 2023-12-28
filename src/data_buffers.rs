@@ -50,9 +50,7 @@ impl DownloadStrategy for SequentialDownload {
     fn next_to_request(&self, buffer: &impl DataBuffer) -> Option<RequestPart> {
         let pieces = &buffer.state().pieces;
         for i in 0..pieces.len() {
-            println!("checking piece {}", i);
             if let Some(p) = pieces.get(i) {
-                println!("got the piece, complete={}", p.complete);
                 if !p.complete {
                     return Some(RequestPart { piece_index: i as u32, offset: p.parts_offset });
                 }
