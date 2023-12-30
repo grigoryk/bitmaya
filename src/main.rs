@@ -1,4 +1,4 @@
-use std::os::fd::{AsFd, AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::io;
 use std::time::Duration;
 use std::{env, collections::HashMap};
@@ -749,7 +749,8 @@ enum PeerConnectionState {
     HandshakeReceiving {
         buff: [u8; 68] // expecting 68 for handshake, 49+len(pstr) assuming pstr="BitTorrent protocol"
     },
-    Interested,
+    InterestedSending { message: Vec<u8> },
+    MessageLoopRead,
 
     // terminal states
     MismatchedInfoHashes
@@ -761,6 +762,7 @@ enum PeerEvent {
     HandshakeSendOk,
     HandshakeReceiveOk,
     MismatchedInfoHashes,
+    InterestedSentOk,
     WouldBlock,
     CanRead,
     CanWrite,
@@ -927,10 +929,14 @@ fn connection_state_machine(state: &PeerConnectionState, event: &PeerEvent) -> O
         },
         PeerConnectionState::HandshakeReceiving { buff } => match event {
             PeerEvent::MismatchedInfoHashes => Some(PeerConnectionState::MismatchedInfoHashes),
-            PeerEvent::HandshakeReceiveOk => Some(PeerConnectionState::Interested),
+            PeerEvent::HandshakeReceiveOk => Some(PeerConnectionState::InterestedSending { message: Message::Interested.to_bytes() }),
             _ => None
         },
-        PeerConnectionState::Interested => todo!(),
+        PeerConnectionState::InterestedSending { message } => match event {
+            PeerEvent::InterestedSentOk => Some(PeerConnectionState::MessageLoopRead),
+            _ => None
+        },
+        PeerConnectionState::MessageLoopRead => todo!(),
 
         // terminal states ignore all events, can't transition out of them
         PeerConnectionState::MismatchedInfoHashes => None,
@@ -991,6 +997,23 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                 }
             },
             _ => None
+        },
+        PeerConnectionState::InterestedSending { message } => match conn.event {
+            Some(PeerEvent::HandshakeReceiveOk) | Some(PeerEvent::Continue) | Some(PeerEvent::CanWrite) => {
+                println!("sending interested message: {:x?}", message);
+                match write_to_stream(&mut conn.stream, message) {
+                    StreamResult::Done => {
+                        epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
+                        Some(PeerEvent::InterestedSentOk)
+                    },
+                    StreamResult::Partial(_) => todo!(),
+                    StreamResult::WouldBlock => {
+                        epoll.add_or_replace(conn.stream.as_raw_fd(), write_interest(conn.peer_id as u64)).expect("add fd worked");
+                        Some(PeerEvent::WouldBlock)
+                    }
+                }
+            },
+            _ => todo!()
         }
         _ => todo!()
     }

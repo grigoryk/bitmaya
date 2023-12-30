@@ -165,7 +165,7 @@ impl Message {
                 bx.append(&mut self.get_length().to_be_bytes().to_vec());
                 bx.push(self.get_id().unwrap());
                 bx.append(&mut piece_index.to_be_bytes().to_vec());
-                // NB: to_be_bytes (be=big-endian) is roughly this:
+                // NB: to_be_bytes (be=big-endian) is basically this:
                 // bx.push(((piece_index & 0xFF000000) >> 24) as u8);
                 // bx.push(((piece_index & 0x00FF0000) >> 16) as u8);
                 // bx.push(((piece_index & 0x0000FF00) >> 8) as u8);
