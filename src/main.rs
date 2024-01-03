@@ -761,7 +761,6 @@ enum PeerConnectionState {
         their_state: PeerState,
         block_index_in_progress: Option<PieceInProgress>,
         skip_parsing: bool,
-        read_zero_counter: i32,
         piece_completed_index: Option<u32>,
         buff: [u8; 65536]
     },
@@ -789,8 +788,8 @@ impl fmt::Display for PeerConnectionState {
             PeerConnectionState::MessageLoopRead { attempt, .. } => {
                 writeln!(f, "State::MessageLoopRead attempt={}, buff=[..]", attempt)
             },
-            PeerConnectionState::MessageLoopProcess { our_state, their_state, block_index_in_progress, skip_parsing, read_zero_counter, piece_completed_index, buff } => {
-                writeln!(f, "State::MessageLoopProcess our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, read_zero_counter={}, piece_completed_index={:?}, buff=[..]", our_state, their_state, block_index_in_progress, skip_parsing, read_zero_counter, piece_completed_index)
+            PeerConnectionState::MessageLoopProcess { our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index, buff } => {
+                writeln!(f, "State::MessageLoopProcess our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, piece_completed_index={:?}, buff=[..]", our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index)
             },
             PeerConnectionState::MismatchedInfoHashes => {
                 writeln!(f, "State::MismatchedInfoHashes")
@@ -1007,7 +1006,6 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
                 their_state: PeerState::ChokingNotInterested,
                 block_index_in_progress: None,
                 skip_parsing: false,
-                read_zero_counter: 0,
                 piece_completed_index: None,
                 buff
             },
@@ -1125,7 +1123,6 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             their_state,
             block_index_in_progress,
             skip_parsing,
-            read_zero_counter,
             piece_completed_index,
             buff } => match conn.event {
                 _ => todo!()
