@@ -1,10 +1,12 @@
 use std::os::fd::{AsRawFd, RawFd};
 use std::io;
+use std::path::Display;
 use std::time::Duration;
 use std::{env, collections::HashMap};
 use form_urlencoded::byte_serialize;
 use mescal::{BencodeItem, AsBencodeBytes, ByteString};
 use sha1::{Sha1, Digest};
+use uuid::Uuid;
 use std::error::Error;
 use std::io::{Read, Write};
 use url::Url;
@@ -750,10 +752,54 @@ enum PeerConnectionState {
         buff: [u8; 68] // expecting 68 for handshake, 49+len(pstr) assuming pstr="BitTorrent protocol"
     },
     InterestedSending { message: Vec<u8> },
-    MessageLoopRead,
+    MessageLoopRead {
+        attempt: i8,
+        buff: [u8; 65536]
+    },
+    MessageLoopProcess {
+        our_state: PeerState,
+        their_state: PeerState,
+        block_index_in_progress: Option<PieceInProgress>,
+        skip_parsing: bool,
+        read_zero_counter: i32,
+        piece_completed_index: Option<u32>,
+        buff: [u8; 65536]
+    },
 
     // terminal states
-    MismatchedInfoHashes
+    MismatchedInfoHashes,
+    GaveUpOnPeer,
+}
+
+impl fmt::Display for PeerConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PeerConnectionState::Start { .. } => {
+                writeln!(f, "State::Start info_hash=[..]")
+            },
+            PeerConnectionState::HandshakeSending { .. } => {
+                writeln!(f, "State::HandshakeSending message=[..]")
+            },
+            PeerConnectionState::HandshakeReceiving { .. } => {
+                writeln!(f, "State::HandshakeReceiving buff=[..]")
+            }
+            PeerConnectionState::InterestedSending { .. } => {
+                writeln!(f, "State::InterestedSending")
+            },
+            PeerConnectionState::MessageLoopRead { attempt, .. } => {
+                writeln!(f, "State::MessageLoopRead attempt={}, buff=[..]", attempt)
+            },
+            PeerConnectionState::MessageLoopProcess { our_state, their_state, block_index_in_progress, skip_parsing, read_zero_counter, piece_completed_index, buff } => {
+                writeln!(f, "State::MessageLoopProcess our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, read_zero_counter={}, piece_completed_index={:?}, buff=[..]", our_state, their_state, block_index_in_progress, skip_parsing, read_zero_counter, piece_completed_index)
+            },
+            PeerConnectionState::MismatchedInfoHashes => {
+                writeln!(f, "State::MismatchedInfoHashes")
+            },
+            PeerConnectionState::GaveUpOnPeer => {
+                writeln!(f, "State::GaveUpOnPeer")
+            },
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -763,15 +809,18 @@ enum PeerEvent {
     HandshakeReceiveOk,
     MismatchedInfoHashes,
     InterestedSentOk,
+    MessageLoopReadOk,
     WouldBlock,
     CanRead,
     CanWrite,
     Continue,
+    GiveUp,
+    Retry
 }
 
 #[derive(Debug)]
 struct PeerConnection {
-    state: PeerConnectionState,
+    id: Uuid,
     event: Option<PeerEvent>,
     stream: TcpStream,
     peer_id: usize
@@ -842,6 +891,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut epoll = Epoll::new();
 
     let mut connections: HashMap<usize, PeerConnection> = HashMap::new();
+    let mut conn_states: HashMap<Uuid, PeerConnectionState> = HashMap::new();
+
     let info_hash = torrent.info_hash_bytes();
 
     for (peer_id, peer) in torrent.peers.as_slice().iter().enumerate() {
@@ -853,26 +904,37 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         };
         if let Some(s) = stream {
+            let conn_id = Uuid::new_v4();
+            let conn_state = PeerConnectionState::Start { info_hash };
             connections.insert(peer_id, PeerConnection {
-                state: PeerConnectionState::Start { info_hash },
+                id: conn_id.clone(),
                 event: Some(PeerEvent::BeginHandshake),
                 stream: s,
                 peer_id
             });
+            conn_states.insert(conn_id, conn_state);
         }
     }
 
     let mut epoll_events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
     loop {
-        for (peer_id, conn) in &mut connections {
+        for (_, conn) in &mut connections {
             if let Some(event) = &conn.event {
-                println!("got event {:?} for state {:?}", event, conn.state);
-                if let Some(next_state) = connection_state_machine(&conn.state, &event) {
-                    println!("next state {:?}", next_state);
-                    conn.state = next_state;
+                // state machine consumes the state, so remove it to obtain ownership and then reinsert or insert new one
+                if let Some(state) = conn_states.remove(&conn.id) {
+                    println!("got event {:?} for state {}", event, state);
+
+                    let next_state = connection_state_machine(state, &event);
+                    println!("next state {}", next_state);
+                    match conn_states.insert(conn.id, next_state) {
+                        Some(_) => panic!("duplicate state insertion for id={}, all states={:#?}", conn.id, conn_states),
+                        None => {},
+                    }
+                } else {
+                    panic!("missing state for id={}; all states: {:#?}", conn.id, conn_states);
                 }
             }
-            let next_event = state_effects(&mut epoll, &mut torrent, conn);
+            let next_event = state_effects(&mut epoll, &mut torrent, conn, &mut conn_states);
             println!("ran state effects, next event {:?}", next_event);
             conn.event = next_event;
         }
@@ -917,35 +979,54 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn connection_state_machine(state: &PeerConnectionState, event: &PeerEvent) -> Option<PeerConnectionState> {
+fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> PeerConnectionState {
     match state {
         PeerConnectionState::Start { info_hash } => match event {
-            PeerEvent::BeginHandshake => Some(PeerConnectionState::HandshakeSending { message: handshake(info_hash) }),
-            _ => None
+            PeerEvent::BeginHandshake => PeerConnectionState::HandshakeSending { message: handshake(&info_hash) },
+            _ => state
         },
-        PeerConnectionState::HandshakeSending { message } => match event {
-            PeerEvent::HandshakeSendOk => Some(PeerConnectionState::HandshakeReceiving { buff: [0; 68] }),
-            _ => None
+        PeerConnectionState::HandshakeSending { .. } => match event {
+            PeerEvent::HandshakeSendOk => PeerConnectionState::HandshakeReceiving { buff: [0; 68] },
+            _ => state
         },
-        PeerConnectionState::HandshakeReceiving { buff } => match event {
-            PeerEvent::MismatchedInfoHashes => Some(PeerConnectionState::MismatchedInfoHashes),
-            PeerEvent::HandshakeReceiveOk => Some(PeerConnectionState::InterestedSending { message: Message::Interested.to_bytes() }),
-            _ => None
+        PeerConnectionState::HandshakeReceiving { .. } => match event {
+            PeerEvent::MismatchedInfoHashes => PeerConnectionState::MismatchedInfoHashes,
+            PeerEvent::HandshakeReceiveOk => PeerConnectionState::InterestedSending { message: Message::Interested.to_bytes() },
+            _ => state
         },
-        PeerConnectionState::InterestedSending { message } => match event {
-            PeerEvent::InterestedSentOk => Some(PeerConnectionState::MessageLoopRead),
-            _ => None
+        PeerConnectionState::InterestedSending { .. } => match event {
+            PeerEvent::InterestedSentOk => PeerConnectionState::MessageLoopRead {
+                attempt: 0,
+                buff: [0; 65536]
+            },
+            _ => state
         },
-        PeerConnectionState::MessageLoopRead => todo!(),
+        PeerConnectionState::MessageLoopRead { attempt, buff } => match event {
+            PeerEvent::MessageLoopReadOk => PeerConnectionState::MessageLoopProcess {
+                our_state: PeerState::ChokingInterested,
+                their_state: PeerState::ChokingNotInterested,
+                block_index_in_progress: None,
+                skip_parsing: false,
+                read_zero_counter: 0,
+                piece_completed_index: None,
+                buff
+            },
+            PeerEvent::Retry => PeerConnectionState::MessageLoopRead { attempt: attempt + 1, buff },
+            PeerEvent::GiveUp => PeerConnectionState::GaveUpOnPeer,
+            _ => state
+        },
+        PeerConnectionState::MessageLoopProcess { .. } => todo!(),
 
         // terminal states ignore all events, can't transition out of them
-        PeerConnectionState::MismatchedInfoHashes => None,
+        PeerConnectionState::MismatchedInfoHashes => state,
+        PeerConnectionState::GaveUpOnPeer => state
 
     }
 }
 
-fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnection) -> Option<PeerEvent> {
-    match &mut conn.state {
+fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnection, conn_states: &mut HashMap<Uuid, PeerConnectionState>) -> Option<PeerEvent> {
+    let state = conn_states.get_mut(&conn.id).expect("missing conn_state");
+    match state {
         PeerConnectionState::HandshakeSending { message } => match conn.event {
             Some(PeerEvent::BeginHandshake) => {
                 match write_to_stream(&mut conn.stream, &message) {
@@ -1001,7 +1082,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
         PeerConnectionState::InterestedSending { message } => match conn.event {
             Some(PeerEvent::HandshakeReceiveOk) | Some(PeerEvent::Continue) | Some(PeerEvent::CanWrite) => {
                 println!("sending interested message: {:x?}", message);
-                match write_to_stream(&mut conn.stream, message) {
+                match write_to_stream(&mut conn.stream, &message) {
                     StreamResult::Done => {
                         epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
                         Some(PeerEvent::InterestedSentOk)
@@ -1014,7 +1095,41 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                 }
             },
             _ => todo!()
-        }
+        },
+        PeerConnectionState::MessageLoopRead { attempt, buff } => match conn.event {
+            Some(PeerEvent::InterestedSentOk) | Some(PeerEvent::CanRead) | Some(PeerEvent::Retry) => {
+                match read_some_to_buffer(&mut conn.stream, buff) {
+                    StreamResultPartial::Read(c) => {
+                        if c == 0 {
+                            if *attempt > 5 {
+                                epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
+                                Some(PeerEvent::GiveUp)
+                            } else {
+                                Some(PeerEvent::Retry)
+                            }
+                        } else {
+                            epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
+                            Some(PeerEvent::MessageLoopReadOk)
+                        }
+                    },
+                    StreamResultPartial::WouldBlock => {
+                        epoll.add_or_replace(conn.stream.as_raw_fd(), read_interest(conn.peer_id as u64)).expect("add fd worked");
+                        Some(PeerEvent::WouldBlock)
+                    },
+                }
+            },
+            _ => todo!()
+        },
+        PeerConnectionState::MessageLoopProcess {
+            our_state,
+            their_state,
+            block_index_in_progress,
+            skip_parsing,
+            read_zero_counter,
+            piece_completed_index,
+            buff } => match conn.event {
+                _ => todo!()
+            }
         _ => todo!()
     }
 }
@@ -1022,6 +1137,11 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
 enum StreamResult {
     Done,
     Partial(usize),
+    WouldBlock
+}
+
+enum StreamResultPartial {
+    Read(usize),
     WouldBlock
 }
 
@@ -1049,6 +1169,16 @@ fn read_to_buffer(stream: &mut TcpStream, expected_bytes: usize, buffer: &mut [u
             }
         },
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => StreamResult::WouldBlock,
+        Err(e) => panic!("error reading from stream - {e}")
+    }
+}
+
+fn read_some_to_buffer(stream: &mut TcpStream, buffer: &mut [u8]) -> StreamResultPartial {
+    match stream.read(buffer) {
+        Ok(c) => {
+            StreamResultPartial::Read(c)
+        },
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => StreamResultPartial::WouldBlock,
         Err(e) => panic!("error reading from stream - {e}")
     }
 }

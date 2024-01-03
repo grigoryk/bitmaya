@@ -7,6 +7,7 @@ use std::fs::File;
 
 use crate::types::{SizedFile, DownloadState, PieceState};
 
+#[derive(Debug, Eq, PartialEq)]
 pub struct PieceInProgress {
     pub index: u32,
     pub missing_bytes: u32
