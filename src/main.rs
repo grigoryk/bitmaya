@@ -1027,16 +1027,13 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
     match state {
         PeerConnectionState::HandshakeSending { message } => match conn.event {
             Some(PeerEvent::BeginHandshake) => {
-                match write_to_stream(&mut conn.stream, &message) {
+                match buffer_to_stream(&mut conn.stream, &message) {
                     StreamResult::Done => {
                         epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
                         Some(PeerEvent::HandshakeSendOk)
                     },
                     StreamResult::Partial(c) => panic!("partial write during handshake: {c} of {}", message.len()),
-                    StreamResult::WouldBlock => {
-                        epoll.add_or_replace(conn.stream.as_raw_fd(), write_interest(conn.peer_id as u64)).expect("add fd worked");
-                        Some(PeerEvent::WouldBlock)
-                    }
+                    StreamResult::WouldBlock => Some(would_block_write(epoll, &conn.stream, conn.peer_id as u64))
                 }
             },
             Some(PeerEvent::CanWrite) => todo!("HandshakeSending:CanWrite handling"),
@@ -1044,7 +1041,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
         },
         PeerConnectionState::HandshakeReceiving { buff } => match conn.event {
             Some(PeerEvent::HandshakeSendOk) | Some(PeerEvent::Continue) | Some(PeerEvent::CanRead) => {
-                match read_to_buffer(&mut conn.stream, buff.len(), buff) {
+                match stream_to_buffer(&mut conn.stream, buff.len(), buff) {
                     StreamResult::Done => {
                         epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
                         let other_pstrlen: usize = buff[0].into();
@@ -1069,10 +1066,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                         }
                     },
                     StreamResult::Partial(_) => Some(PeerEvent::Continue),
-                    StreamResult::WouldBlock => {
-                        epoll.add_or_replace(conn.stream.as_raw_fd(), read_interest(conn.peer_id as u64)).expect("epoll_modify_fd");
-                        Some(PeerEvent::WouldBlock)
-                    }
+                    StreamResult::WouldBlock => Some(would_block_read(epoll, &conn.stream, conn.peer_id as u64))
                 }
             },
             _ => None
@@ -1080,23 +1074,20 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
         PeerConnectionState::InterestedSending { message } => match conn.event {
             Some(PeerEvent::HandshakeReceiveOk) | Some(PeerEvent::Continue) | Some(PeerEvent::CanWrite) => {
                 println!("sending interested message: {:x?}", message);
-                match write_to_stream(&mut conn.stream, &message) {
+                match buffer_to_stream(&mut conn.stream, &message) {
                     StreamResult::Done => {
                         epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
                         Some(PeerEvent::InterestedSentOk)
                     },
                     StreamResult::Partial(_) => todo!(),
-                    StreamResult::WouldBlock => {
-                        epoll.add_or_replace(conn.stream.as_raw_fd(), write_interest(conn.peer_id as u64)).expect("add fd worked");
-                        Some(PeerEvent::WouldBlock)
-                    }
+                    StreamResult::WouldBlock => Some(would_block_write(epoll, &conn.stream, conn.peer_id as u64))
                 }
             },
             _ => todo!()
         },
         PeerConnectionState::MessageLoopRead { attempt, buff } => match conn.event {
             Some(PeerEvent::InterestedSentOk) | Some(PeerEvent::CanRead) | Some(PeerEvent::Retry) => {
-                match read_some_to_buffer(&mut conn.stream, buff) {
+                match stream_to_buffer_partial(&mut conn.stream, buff) {
                     StreamResultPartial::Read(c) => {
                         if c == 0 {
                             if *attempt > 5 {
@@ -1110,10 +1101,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                             Some(PeerEvent::MessageLoopReadOk)
                         }
                     },
-                    StreamResultPartial::WouldBlock => {
-                        epoll.add_or_replace(conn.stream.as_raw_fd(), read_interest(conn.peer_id as u64)).expect("add fd worked");
-                        Some(PeerEvent::WouldBlock)
-                    },
+                    StreamResultPartial::WouldBlock => Some(would_block_read(epoll, &conn.stream, conn.peer_id as u64)),
                 }
             },
             _ => todo!()
@@ -1142,7 +1130,7 @@ enum StreamResultPartial {
     WouldBlock
 }
 
-fn write_to_stream(stream: &mut TcpStream, buffer: &[u8]) -> StreamResult {
+fn buffer_to_stream(stream: &mut TcpStream, buffer: &[u8]) -> StreamResult {
     match stream.write(buffer) {
         Ok(c) => {
             if c == buffer.len() {
@@ -1156,7 +1144,7 @@ fn write_to_stream(stream: &mut TcpStream, buffer: &[u8]) -> StreamResult {
     }
 }
 
-fn read_to_buffer(stream: &mut TcpStream, expected_bytes: usize, buffer: &mut [u8]) -> StreamResult {
+fn stream_to_buffer(stream: &mut TcpStream, expected_bytes: usize, buffer: &mut [u8]) -> StreamResult {
     match stream.read(buffer) {
         Ok(c) => {
             if c == expected_bytes {
@@ -1170,7 +1158,7 @@ fn read_to_buffer(stream: &mut TcpStream, expected_bytes: usize, buffer: &mut [u
     }
 }
 
-fn read_some_to_buffer(stream: &mut TcpStream, buffer: &mut [u8]) -> StreamResultPartial {
+fn stream_to_buffer_partial(stream: &mut TcpStream, buffer: &mut [u8]) -> StreamResultPartial {
     match stream.read(buffer) {
         Ok(c) => {
             StreamResultPartial::Read(c)
@@ -1192,4 +1180,14 @@ fn write_interest(key: u64) -> libc::epoll_event {
         events: libc::EPOLLOUT as u32,
         u64: key
     }
+}
+
+fn would_block_write(epoll: &mut Epoll, stream: &TcpStream, peer: u64) -> PeerEvent {
+    epoll.add_or_replace(stream.as_raw_fd(), write_interest(peer)).expect("add fd worked");
+    PeerEvent::WouldBlock
+}
+
+fn would_block_read(epoll: &mut Epoll, stream: &TcpStream, peer: u64) -> PeerEvent {
+    epoll.add_or_replace(stream.as_raw_fd(), read_interest(peer)).expect("add fd worked");
+    PeerEvent::WouldBlock
 }
