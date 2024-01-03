@@ -827,12 +827,17 @@ struct PeerConnection {
 
 struct Epoll {
     fd: RawFd,
-    watched: HashMap<RawFd, libc::epoll_event>
+    watched: HashMap<RawFd, libc::epoll_event>,
+    events: Vec<libc::epoll_event>
 }
 
 impl Epoll {
     pub fn new() -> Self {
-        Self { fd: Epoll::epoll_create().expect("epoll create worked"), watched: HashMap::new() }
+        Self {
+            fd: Epoll::epoll_create().expect("epoll create worked"),
+            watched: HashMap::new(),
+            events: Vec::with_capacity(1024)
+        }
     }
 
     fn epoll_create() -> io::Result<RawFd> {
@@ -915,7 +920,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut epoll_events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
     loop {
         for (_, conn) in &mut connections {
             if let Some(event) = &conn.event {
@@ -940,8 +944,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         if epoll.watched.len() > 0 {
             println!("epoll_wait");
-            epoll_events.clear();
-            let event_count = match syscall!(epoll_wait(epoll.fd, epoll_events.as_mut_ptr() as *mut libc::epoll_event, 1024, 1000 as libc::c_int)) {
+            epoll.events.clear();
+            let event_count = match syscall!(epoll_wait(epoll.fd, epoll.events.as_mut_ptr() as *mut libc::epoll_event, 1024, 1000 as libc::c_int)) {
                 Ok(count) => {
                     println!("epoll_wait returned with events: {count}");
                     count
@@ -949,9 +953,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Err(e) => panic!("error during epoll_wait {e}")
             };
             // OS will write events into events vec, return us number of events;
-            unsafe { epoll_events.set_len(event_count as usize); }
+            unsafe { epoll.events.set_len(event_count as usize); }
 
-            for epoll_event in &epoll_events {
+            for epoll_event in &epoll.events {
                 let peer_id = epoll_event.u64 as usize;
                 if let Some(conn) = connections.get_mut(&peer_id) {
                     // if we already have a pending event for the state, don't override it with what we get back from epoll
