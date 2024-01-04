@@ -1012,23 +1012,25 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
     match state {
         PeerConnectionState::Start { info_hash } => match event {
             PeerEvent::BeginHandshake => PeerConnectionState::HandshakeSending { message: handshake(&info_hash) },
-            _ => state
+            _ => todo!()
         },
         PeerConnectionState::HandshakeSending { .. } => match event {
             PeerEvent::HandshakeSendOk => PeerConnectionState::HandshakeReceiving { buff: [0; 68] },
-            _ => state
+            PeerEvent::CanWrite | PeerEvent::WouldBlock => state,
+            _ => todo!()
         },
         PeerConnectionState::HandshakeReceiving { .. } => match event {
             PeerEvent::MismatchedInfoHashes => PeerConnectionState::MismatchedInfoHashes,
             PeerEvent::HandshakeReceiveOk => PeerConnectionState::InterestedSending { message: Message::Interested.to_bytes() },
-            _ => state
+            PeerEvent::Continue | PeerEvent::CanRead | PeerEvent::WouldBlock => state,
+            _ => todo!()
         },
         PeerConnectionState::InterestedSending { .. } => match event {
             PeerEvent::InterestedSentOk => PeerConnectionState::MessageRead {
                 attempt: 0,
                 buff: [0; 65536]
             },
-            _ => state
+            _ => todo!()
         },
         PeerConnectionState::MessageRead { attempt, buff } => match event {
             PeerEvent::MessageReadOk { byte_count } => PeerConnectionState::MessageParse {
@@ -1038,7 +1040,8 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
             },
             PeerEvent::Retry => PeerConnectionState::MessageRead { attempt: attempt + 1, buff },
             PeerEvent::GiveUp => PeerConnectionState::GaveUpOnPeer,
-            _ => state
+            PeerEvent::CanRead | PeerEvent::WouldBlock => state,
+            _ => todo!()
         },
         PeerConnectionState::MessageParse { bytes_read, buff, their_state } => match event {
             PeerEvent::TheirStateChanged { state } => PeerConnectionState::SendRequestPiece,
@@ -1048,16 +1051,16 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
             },
             PeerEvent::PieceCorrupt { index } => todo!(),
             PeerEvent::GotBitfield { has_pieces } => PeerConnectionState::MessageRead { attempt: 0, buff: [0; 65536] },
-            _ => state
+            _ => todo!()
         },
         PeerConnectionState::MessagePieceReceive { attempt, missing_bytes, buff, their_state, .. } => match event {
             PeerEvent::PieceCompleted { index } => PeerConnectionState::SendHave { index: *index },
             PeerEvent::PieceCorrupt { .. } => todo!(),
-            _ => state
+            _ => todo!()
         },
         PeerConnectionState::SendHave { index } => match event {
             PeerEvent::SendHaveOk => todo!(),
-            _ => state
+            _ => todo!()
         }
         PeerConnectionState::SendRequestPiece => todo!(),
         // terminal states ignore all events, can't transition out of them
