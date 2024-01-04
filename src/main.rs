@@ -40,7 +40,7 @@ macro_rules! syscall {
     }};
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum PeerState {
     NotChokingNotInterested,
     NotChokingInterested,
@@ -110,7 +110,8 @@ struct Torrent {
 
     // our state
     uploaded: u32,
-    downloaded: u32
+    downloaded: u32,
+    data: InMemoryData,
 }
 
 impl fmt::Display for Torrent {
@@ -727,7 +728,8 @@ impl TryFrom<BencodeItem> for Torrent {
             info_bytes: info.as_bytes(),
             peers: vec!(),
             uploaded: 0,
-            downloaded: 0
+            downloaded: 0,
+            data: InMemoryData::new(pieces_length as u32 / 20)
         })
     }
 }
@@ -759,11 +761,7 @@ enum PeerConnectionState {
     MessageParse {
         bytes_read: usize,
         buff: [u8; 65536],
-        our_state: PeerState,
         their_state: PeerState,
-        block_index_in_progress: Option<PieceInProgress>,
-        skip_parsing: bool,
-        piece_completed_index: Option<u32>,
     },
 
     // terminal states
@@ -789,8 +787,8 @@ impl fmt::Display for PeerConnectionState {
             PeerConnectionState::MessageRead { attempt, .. } => {
                 writeln!(f, "State::MessageLoopRead attempt={}, buff=[..]", attempt)
             },
-            PeerConnectionState::MessageParse { bytes_read, our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index, buff } => {
-                writeln!(f, "State::MessageLoopProcess bytes_read={} our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, piece_completed_index={:?}, buff=[..]", bytes_read, our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index)
+            PeerConnectionState::MessageParse { bytes_read, their_state, .. } => {
+                writeln!(f, "State::MessageLoopProcess bytes_read={} their_state={:?}, buff=[..]", bytes_read, their_state)
             },
             PeerConnectionState::MismatchedInfoHashes => {
                 writeln!(f, "State::MismatchedInfoHashes")
@@ -810,6 +808,10 @@ enum PeerEvent {
     MismatchedInfoHashes,
     InterestedSentOk,
     MessageLoopReadOk { byte_count: usize },
+    TheirStateChanged { state: PeerState },
+    PieceCompleted { index: u32 },
+    PieceIncomplete { index: u32, missing_bytes: usize },
+    PieceCorrupt { index: u32 },
     WouldBlock,
     CanRead,
     CanWrite,
@@ -1008,18 +1010,20 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
         PeerConnectionState::MessageRead { attempt, buff } => match event {
             PeerEvent::MessageLoopReadOk { byte_count } => PeerConnectionState::MessageParse {
                 bytes_read: *byte_count,
-                our_state: PeerState::ChokingInterested,
                 their_state: PeerState::ChokingNotInterested,
-                block_index_in_progress: None,
-                skip_parsing: false,
-                piece_completed_index: None,
                 buff
             },
             PeerEvent::Retry => PeerConnectionState::MessageRead { attempt: attempt + 1, buff },
             PeerEvent::GiveUp => PeerConnectionState::GaveUpOnPeer,
             _ => state
         },
-        PeerConnectionState::MessageParse { .. } => todo!(),
+        PeerConnectionState::MessageParse { .. } => match event {
+            PeerEvent::TheirStateChanged { state } => todo!(),
+            PeerEvent::PieceCompleted { index } => todo!(),
+            PeerEvent::PieceIncomplete { index, missing_bytes } => todo!(),
+            PeerEvent::PieceCorrupt { index } => todo!(),
+            _ => state
+        },
 
         // terminal states ignore all events, can't transition out of them
         PeerConnectionState::MismatchedInfoHashes => state,
@@ -1114,14 +1118,100 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
         },
         PeerConnectionState::MessageParse {
             bytes_read,
-            our_state,
             their_state,
-            block_index_in_progress,
-            skip_parsing,
-            piece_completed_index,
             buff } => match conn.event {
-                Some(_) => todo!(),
-                None => todo!(),
+                Some(PeerEvent::MessageLoopReadOk { byte_count }) => {
+                    let parsed = match Message::from_bytes(buff, byte_count) {
+                        Ok(m) => m,
+                        Err(e) => todo!("bad message parse {}", e),
+                    };
+                    println!("got message: {}", parsed);
+                    Some(match parsed {
+                        Message::KeepAlive => todo!("keep-alive"),
+                        Message::Choke => {
+                            PeerEvent::TheirStateChanged { state: match their_state {
+                                PeerState::NotChokingNotInterested => PeerState::ChokingNotInterested,
+                                PeerState::NotChokingInterested => PeerState::ChokingInterested,
+                                PeerState::ChokingNotInterested => PeerState::ChokingNotInterested,
+                                PeerState::ChokingInterested => PeerState::ChokingInterested,
+                            }}
+                        },
+                        Message::Unchoke => {
+                            PeerEvent::TheirStateChanged { state: match their_state {
+                                PeerState::NotChokingNotInterested => PeerState::NotChokingNotInterested,
+                                PeerState::NotChokingInterested => PeerState::NotChokingInterested,
+                                PeerState::ChokingNotInterested => PeerState::NotChokingNotInterested,
+                                PeerState::ChokingInterested => PeerState::NotChokingInterested,
+                            }}
+                        },
+                        Message::Interested => {
+                            PeerEvent::TheirStateChanged { state: match their_state {
+                                PeerState::NotChokingNotInterested => PeerState::NotChokingInterested,
+                                PeerState::NotChokingInterested => PeerState::NotChokingInterested,
+                                PeerState::ChokingNotInterested => PeerState::ChokingInterested,
+                                PeerState::ChokingInterested => PeerState::ChokingInterested,
+                            }}
+                        },
+                        Message::NotInterested => {
+                            PeerEvent::TheirStateChanged { state: match their_state {
+                                PeerState::NotChokingNotInterested => PeerState::NotChokingNotInterested,
+                                PeerState::NotChokingInterested => PeerState::NotChokingNotInterested,
+                                PeerState::ChokingNotInterested => PeerState::ChokingNotInterested,
+                                PeerState::ChokingInterested => PeerState::ChokingNotInterested,
+                            }}
+                        },
+                        Message::Have { piece_index } => todo!("have"),
+                        Message::Bitfield { bitfield } => {
+                            let num_of_pieces = torrent.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
+                            let mut has_pieces = 0;
+                            println!("there are {} pieces", num_of_pieces);
+                            for i in 0..num_of_pieces - 1 {
+                                println!("checking piece {}", i);
+                                let nth = i % 8;
+                                println!("bitmask {:08b}", 128 >> nth);
+                                let byte_num = i / 8;
+                                println!("byte number: {}", byte_num);
+                                println!("{:b} & {:08b}", bitfield[byte_num], 128 >> nth);
+                                if bitfield[byte_num] & 128 >> nth != 0 {
+                                    println!("has piece {}", i);
+                                    has_pieces += 1;
+                                } else {
+                                    println!("missing piece {}", i);
+                                }
+                            }
+                            println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
+                            todo!("bitfield")
+                        },
+                        Message::Request { index, begin, length } => todo!("ignoring request msg - index={}, begin={}, length={}", index, begin, length),
+                        Message::Piece { length, index, begin, block } => {
+                            let block_len = block.len();
+                            torrent.data.append_to_piece(index, block).expect("data append worked");
+
+                            // 9 = size of piece message minus the block bytes
+                            if (length - 9) > byte_count {
+                                println!("piece message incomplete. expected length={}, got length={}, missing bytes={}", length - 9, block_len, length - 9 - block_len);
+                                PeerEvent::PieceIncomplete { index, missing_bytes: length - 9 - block_len }
+                            } else {
+                                println!("piece message appears complete: length-9={}, block len={}", length - 9, block_len);
+
+                                if torrent.pieces.hash_for_index(index) == torrent.data.get_piece(index).unwrap().hash() {
+                                    torrent.data.mark_piece_completed(index).expect("todo: mark_piece_complete failed");
+                                    println!("piece completed at index={}", index);
+                                    PeerEvent::PieceCompleted { index }
+                                } else {
+                                    PeerEvent::PieceCorrupt { index }
+                                }
+                            }
+                        },
+                        Message::Cancel { index, begin, length } => {
+                            todo!("ignoring cancel msg - index={}, begin={}, length={}", index, begin, length)
+                        },
+                        Message::Port { listen_port } => {
+                            todo!("ignoring port msg - port={}", listen_port)
+                        },
+                    })
+                },
+                _ => None,
             }
         _ => todo!()
     }

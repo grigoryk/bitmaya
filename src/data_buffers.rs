@@ -13,6 +13,7 @@ pub struct PieceInProgress {
     pub missing_bytes: usize
 }
 
+#[derive(Debug)]
 pub struct Piece {
     parts: Vec<u8>
 }
@@ -140,6 +141,7 @@ impl DataBuffer for OnDiskData {
     }
 }
 
+#[derive(Debug)]
 pub struct InMemoryData {
     state: DownloadState,
     pieces: HashMap<u32, Piece>

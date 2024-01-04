@@ -43,7 +43,7 @@ impl Message {
         }
         let bytes = bytes.unwrap();
         let length: usize = match bytes.get(0..4) {
-            Some(bx) => usize::from_be_bytes([bx[0], bx[1], bx[2], bx[3], 0, 0, 0, 0]),
+            Some(bx) => usize::from_be_bytes([0, 0, 0, 0, bx[0], bx[1], bx[2], bx[3]]),
             None => return Err("missing length bytes"),
         };
         println!("got length={}", length);
