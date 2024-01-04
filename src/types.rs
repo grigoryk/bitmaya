@@ -4,7 +4,7 @@ pub struct SizedFile {
     pub length: u64
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PieceState {
     pub complete: bool,
     pub parts_offset: u32
@@ -14,7 +14,7 @@ pub struct PieceState {
 // - list of pieces
 // - is piece complete
 // - piece parts offset for each piece
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DownloadState {
     pub pieces: Vec<PieceState>
 }

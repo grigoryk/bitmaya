@@ -832,6 +832,8 @@ enum PeerEvent {
     PieceCorrupt { index: u32 },
     GotBitfield { has_pieces: Vec<bool> },
     SendHaveOk,
+    SendRequestPieceOk,
+    HaveAllPieces,
     WouldBlock,
     CanRead,
     CanWrite,
@@ -945,24 +947,31 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         for (_, conn) in &mut connections {
-            if let Some(event) = &conn.event {
-                // state machine consumes the state, so remove it to obtain ownership and then reinsert or insert new one
-                if let Some(state) = conn_states.remove(&conn.id) {
+            // state machine consumes the state, so remove it to obtain ownership and then reinsert or insert new one
+            if let Some(state) = conn_states.remove(&conn.id) {
+                match state {
+                    PeerConnectionState::GaveUpOnPeer => return Ok(()),
+                    _ => {}
+                }
+                let mut next_state = if let Some(event) = &conn.event {
                     println!("got event {:?} for state {}", event, state);
 
                     let next_state = connection_state_machine(state, &event);
                     println!("next state {}", next_state);
-                    match conn_states.insert(conn.id, next_state) {
-                        Some(_) => panic!("duplicate state insertion for id={}, all states={:#?}", conn.id, conn_states),
-                        None => {},
-                    }
+                    next_state
                 } else {
-                    panic!("missing state for id={}; all states: {:#?}", conn.id, conn_states);
+                    state
+                };
+                let next_event = state_effects(&mut epoll, &mut torrent, conn, &mut next_state);
+                match conn_states.insert(conn.id, next_state) {
+                    Some(_) => panic!("duplicate state insertion for id={}, all states={:#?}", conn.id, conn_states),
+                    None => {},
                 }
+                println!("ran state effects, next event {:?}", next_event);
+                conn.event = next_event;
+            } else {
+                panic!("missing state for id={}; all states: {:#?}", conn.id, conn_states);
             }
-            let next_event = state_effects(&mut epoll, &mut torrent, conn, &mut conn_states);
-            println!("ran state effects, next event {:?}", next_event);
-            conn.event = next_event;
         }
 
         if epoll.watched.len() > 0 {
@@ -1056,13 +1065,20 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
         PeerConnectionState::MessagePieceReceive { attempt, missing_bytes, buff, their_state, .. } => match event {
             PeerEvent::PieceCompleted { index } => PeerConnectionState::SendHave { index: *index },
             PeerEvent::PieceCorrupt { .. } => todo!(),
+            PeerEvent::CanRead => state,
             _ => todo!()
         },
         PeerConnectionState::SendHave { index } => match event {
-            PeerEvent::SendHaveOk => todo!(),
+            PeerEvent::SendHaveOk => PeerConnectionState::SendRequestPiece,
             _ => todo!()
         }
-        PeerConnectionState::SendRequestPiece => todo!(),
+        PeerConnectionState::SendRequestPiece => match event {
+            PeerEvent::SendRequestPieceOk => PeerConnectionState::MessageRead { attempt: 0, buff: [0; 65536] },
+            PeerEvent::CanWrite | PeerEvent::WouldBlock => state,
+            PeerEvent::HaveAllPieces => PeerConnectionState::GaveUpOnPeer, // TODO
+            _ => todo!()
+        },
+
         // terminal states ignore all events, can't transition out of them
         PeerConnectionState::MismatchedInfoHashes => state,
         PeerConnectionState::GaveUpOnPeer => state
@@ -1070,8 +1086,7 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
     }
 }
 
-fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnection, conn_states: &mut HashMap<Uuid, PeerConnectionState>) -> Option<PeerEvent> {
-    let state = conn_states.get_mut(&conn.id).expect("missing conn_state");
+fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnection, state: &mut PeerConnectionState) -> Option<PeerEvent> {
     match state {
         PeerConnectionState::HandshakeSending { message } => match conn.event {
             Some(PeerEvent::BeginHandshake) => {
@@ -1134,7 +1149,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             _ => todo!()
         },
         PeerConnectionState::MessageRead { attempt, buff } => match conn.event {
-            Some(PeerEvent::InterestedSentOk | PeerEvent::CanRead | PeerEvent::Retry | PeerEvent::GotBitfield { .. }) => {
+            Some(PeerEvent::InterestedSentOk | PeerEvent::CanRead | PeerEvent::Retry | PeerEvent::GotBitfield { .. } | PeerEvent::SendRequestPieceOk) => {
                 match stream_to_buffer_partial(&mut conn.stream, buff) {
                     StreamResultPartial::Read(c) => {
                         if c == 0 {
@@ -1263,7 +1278,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             missing_bytes,
             buff,
             their_state } => match conn.event {
-                Some(PeerEvent::PieceIncomplete { index, missing_bytes }) => {
+                Some(PeerEvent::PieceIncomplete { .. } | PeerEvent::CanRead) => {
                     Some(match stream_to_buffer_partial(&mut conn.stream, buff) {
                         StreamResultPartial::Read(c) => {
                             if c == 0 {
@@ -1277,18 +1292,18 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                                 epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
 
                                 println!("piece in progress, appending...");
-                                torrent.data.append_to_piece(index, buff.get(0..c).unwrap().to_vec()).expect("append_to_piece");
+                                torrent.data.append_to_piece(*index, buff.get(0..c).unwrap().to_vec()).expect("append_to_piece");
 
-                                if c == missing_bytes {
+                                if c == *missing_bytes {
                                     println!("got the rest of missing bytes!");
-                                    if torrent.pieces.hash_for_index(index) == torrent.data.get_piece(index).unwrap().hash() {
-                                        torrent.data.mark_piece_completed(index).expect("mark_piece_completed");
+                                    if torrent.pieces.hash_for_index(*index) == torrent.data.get_piece(*index).unwrap().hash() {
+                                        torrent.data.mark_piece_completed(*index).expect("mark_piece_completed");
                                     }
 
-                                    PeerEvent::PieceCompleted { index }
+                                    PeerEvent::PieceCompleted { index: *index }
 
                                 } else {
-                                    PeerEvent::PieceIncomplete { index, missing_bytes: missing_bytes - c }
+                                    PeerEvent::PieceIncomplete { index: *index, missing_bytes: *missing_bytes - c }
                                 }
                             }
                         },
@@ -1310,11 +1325,46 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             },
             _ => todo!(),
         },
-        PeerConnectionState::SendRequestPiece => todo!(),
+        PeerConnectionState::SendRequestPiece => match conn.event {
+            Some(PeerEvent::TheirStateChanged { .. } | PeerEvent::SendHaveOk) => {
+                let download_algorithm = SequentialDownload {};
+                // TODO split "next_to_request" into its own state, this one should just own sending
+                // TODO incorporate bitfield info
+                match download_algorithm.next_to_request(&torrent.data) {
+                    Some(rp) => {
+                        println!("requesting piece part={:?}", rp);
+                        let num_of_pieces = torrent.pieces.len() as u32 / 20;
+                        let request_msg = if rp.piece_index != (num_of_pieces - 1) {
+                            Message::Request {
+                                index: rp.piece_index, begin: rp.offset, length: 16384 // 16kb
+                            }
+                        } else {
+                            // last piece
+                            let remaining_bytes = torrent.length as u32 - torrent.data.total_byte_len() as u32;
+                            Message::Request {
+                                index: rp.piece_index, begin: rp.offset, length: remaining_bytes
+                            }
+                        };
+                        println!("request_msg - {}", request_msg);
+                        let request_msg = request_msg.to_bytes();
+                        println!("sending request message: {:0x?}", request_msg);
+                        match buffer_to_stream(&mut conn.stream, &request_msg) {
+                            StreamResult::Done => Some(PeerEvent::SendRequestPieceOk),
+                            StreamResult::Partial(_) => todo!(),
+                            StreamResult::WouldBlock => Some(would_block_read(epoll, &conn.stream, conn.peer_id as u64)),
+                        }
+                    },
+                    None => {
+                        torrent.data.clone().flush(&torrent.files).expect("flush");
+                        Some(PeerEvent::HaveAllPieces)
+                    }
+                }
+            }
+            _ => todo!()
+        },
         PeerConnectionState::Start { .. } => None,
         PeerConnectionState::MismatchedInfoHashes => None,
         PeerConnectionState::GaveUpOnPeer => None,
-
     }
 }
 
