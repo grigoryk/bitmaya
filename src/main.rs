@@ -40,7 +40,7 @@ macro_rules! syscall {
     }};
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 enum PeerState {
     NotChokingNotInterested,
     NotChokingInterested,
@@ -763,6 +763,15 @@ enum PeerConnectionState {
         buff: [u8; 65536],
         their_state: PeerState,
     },
+    MessagePieceReceive {
+        attempt: i8,
+        index: u32,
+        missing_bytes: usize,
+        buff: [u8; 65536],
+        their_state: PeerState,
+    },
+    SendHave { index: u32 },
+    SendRequestPiece,
 
     // terminal states
     MismatchedInfoHashes,
@@ -774,28 +783,37 @@ impl fmt::Display for PeerConnectionState {
         match self {
             PeerConnectionState::Start { .. } => {
                 writeln!(f, "State::Start info_hash=[..]")
-            },
+            }
             PeerConnectionState::HandshakeSending { .. } => {
                 writeln!(f, "State::HandshakeSending message=[..]")
-            },
+            }
             PeerConnectionState::HandshakeReceiving { .. } => {
                 writeln!(f, "State::HandshakeReceiving buff=[..]")
             }
             PeerConnectionState::InterestedSending { .. } => {
                 writeln!(f, "State::InterestedSending")
-            },
+            }
             PeerConnectionState::MessageRead { attempt, .. } => {
-                writeln!(f, "State::MessageLoopRead attempt={}, buff=[..]", attempt)
-            },
+                writeln!(f, "State::MessageRead attempt={}, buff=[..]", attempt)
+            }
             PeerConnectionState::MessageParse { bytes_read, their_state, .. } => {
-                writeln!(f, "State::MessageLoopProcess bytes_read={} their_state={:?}, buff=[..]", bytes_read, their_state)
-            },
+                writeln!(f, "State::MessageParse bytes_read={} their_state={:?}, buff=[..]", bytes_read, their_state)
+            }
+            PeerConnectionState::MessagePieceReceive { attempt, index, missing_bytes, buff, their_state } => {
+                writeln!(f, "State::MessagePieceReceive attempt={} index={} missing_bytes={}, buff=[..], their_state={:?}", attempt, index, missing_bytes, their_state)
+            }
+            PeerConnectionState::SendHave { index } => {
+                writeln!(f, "State::SendHave index={}", index)
+            }
+            PeerConnectionState::SendRequestPiece => {
+                writeln!(f, "State::SendRequestPiece")
+            }
             PeerConnectionState::MismatchedInfoHashes => {
                 writeln!(f, "State::MismatchedInfoHashes")
-            },
+            }
             PeerConnectionState::GaveUpOnPeer => {
                 writeln!(f, "State::GaveUpOnPeer")
-            },
+            }
         }
     }
 }
@@ -807,11 +825,13 @@ enum PeerEvent {
     HandshakeReceiveOk,
     MismatchedInfoHashes,
     InterestedSentOk,
-    MessageLoopReadOk { byte_count: usize },
+    MessageReadOk { byte_count: usize },
     TheirStateChanged { state: PeerState },
     PieceCompleted { index: u32 },
     PieceIncomplete { index: u32, missing_bytes: usize },
     PieceCorrupt { index: u32 },
+    GotBitfield { has_pieces: Vec<bool> },
+    SendHaveOk,
     WouldBlock,
     CanRead,
     CanWrite,
@@ -963,15 +983,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(conn) = connections.get_mut(&peer_id) {
                     // if we already have a pending event for the state, don't override it with what we get back from epoll
                     // for example, a pending event could indicate that an IO operation was completed and will trigger a state transition
-                    if conn.event != Some(PeerEvent::WouldBlock) {
-                        continue;
-                    }
-                    conn.event = if epoll_event.events as i32 & libc::EPOLLIN == libc::EPOLLIN {
-                        Some(PeerEvent::CanRead)
-                    } else if epoll_event.events as i32 & libc::EPOLLOUT == libc::EPOLLOUT {
-                        Some(PeerEvent::CanWrite)
+                    if conn.event == Some(PeerEvent::WouldBlock) || conn.event == None {
+                        conn.event = if epoll_event.events as i32 & libc::EPOLLIN == libc::EPOLLIN {
+                            println!("epoll_read_event");
+                            Some(PeerEvent::CanRead)
+                        } else if epoll_event.events as i32 & libc::EPOLLOUT == libc::EPOLLOUT {
+                            println!("epoll_write_event");
+                            Some(PeerEvent::CanWrite)
+                        } else {
+                            panic!("unexpected epoll event: {:?}", epoll_event.events as i32)
+                        }
                     } else {
-                        panic!("unexpected epoll event: {:?}", epoll_event.events as i32)
+                        println!("ignoring epoll event since conn.event={:?}", conn.event)
                     }
                 } else {
                     panic!("unexpected peer_id from epoll: {peer_id}, u64={}", epoll_event.u64 as usize);
@@ -1008,7 +1031,7 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
             _ => state
         },
         PeerConnectionState::MessageRead { attempt, buff } => match event {
-            PeerEvent::MessageLoopReadOk { byte_count } => PeerConnectionState::MessageParse {
+            PeerEvent::MessageReadOk { byte_count } => PeerConnectionState::MessageParse {
                 bytes_read: *byte_count,
                 their_state: PeerState::ChokingNotInterested,
                 buff
@@ -1017,14 +1040,26 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
             PeerEvent::GiveUp => PeerConnectionState::GaveUpOnPeer,
             _ => state
         },
-        PeerConnectionState::MessageParse { .. } => match event {
-            PeerEvent::TheirStateChanged { state } => todo!(),
+        PeerConnectionState::MessageParse { bytes_read, buff, their_state } => match event {
+            PeerEvent::TheirStateChanged { state } => PeerConnectionState::SendRequestPiece,
             PeerEvent::PieceCompleted { index } => todo!(),
-            PeerEvent::PieceIncomplete { index, missing_bytes } => todo!(),
+            PeerEvent::PieceIncomplete { index, missing_bytes } => PeerConnectionState::MessagePieceReceive {
+                attempt: 0, index: *index, missing_bytes: *missing_bytes, buff, their_state
+            },
             PeerEvent::PieceCorrupt { index } => todo!(),
+            PeerEvent::GotBitfield { has_pieces } => PeerConnectionState::MessageRead { attempt: 0, buff: [0; 65536] },
             _ => state
         },
-
+        PeerConnectionState::MessagePieceReceive { attempt, missing_bytes, buff, their_state, .. } => match event {
+            PeerEvent::PieceCompleted { index } => PeerConnectionState::SendHave { index: *index },
+            PeerEvent::PieceCorrupt { .. } => todo!(),
+            _ => state
+        },
+        PeerConnectionState::SendHave { index } => match event {
+            PeerEvent::SendHaveOk => todo!(),
+            _ => state
+        }
+        PeerConnectionState::SendRequestPiece => todo!(),
         // terminal states ignore all events, can't transition out of them
         PeerConnectionState::MismatchedInfoHashes => state,
         PeerConnectionState::GaveUpOnPeer => state
@@ -1096,7 +1131,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             _ => todo!()
         },
         PeerConnectionState::MessageRead { attempt, buff } => match conn.event {
-            Some(PeerEvent::InterestedSentOk) | Some(PeerEvent::CanRead) | Some(PeerEvent::Retry) => {
+            Some(PeerEvent::InterestedSentOk | PeerEvent::CanRead | PeerEvent::Retry | PeerEvent::GotBitfield { .. }) => {
                 match stream_to_buffer_partial(&mut conn.stream, buff) {
                     StreamResultPartial::Read(c) => {
                         if c == 0 {
@@ -1108,19 +1143,22 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                             }
                         } else {
                             epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
-                            Some(PeerEvent::MessageLoopReadOk { byte_count: c })
+                            Some(PeerEvent::MessageReadOk { byte_count: c })
                         }
                     },
                     StreamResultPartial::WouldBlock => Some(would_block_read(epoll, &conn.stream, conn.peer_id as u64)),
                 }
             },
-            _ => todo!()
+            Some(PeerEvent::WouldBlock) => None,
+            Some(_) => todo!("{:?}", conn.event),
+            None => None
+
         },
         PeerConnectionState::MessageParse {
             bytes_read,
             their_state,
             buff } => match conn.event {
-                Some(PeerEvent::MessageLoopReadOk { byte_count }) => {
+                Some(PeerEvent::MessageReadOk { byte_count }) => {
                     let parsed = match Message::from_bytes(buff, byte_count) {
                         Ok(m) => m,
                         Err(e) => todo!("bad message parse {}", e),
@@ -1160,9 +1198,10 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                                 PeerState::ChokingInterested => PeerState::ChokingNotInterested,
                             }}
                         },
-                        Message::Have { piece_index } => todo!("have"),
+                        Message::Have { piece_index } => todo!("have piece index {}", piece_index ),
                         Message::Bitfield { bitfield } => {
                             let num_of_pieces = torrent.pieces.len() / 20; // pieces is concat of 20-byte hashes for each piece
+                            let mut has_pieces_vec = vec![];
                             let mut has_pieces = 0;
                             println!("there are {} pieces", num_of_pieces);
                             for i in 0..num_of_pieces - 1 {
@@ -1174,13 +1213,15 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                                 println!("{:b} & {:08b}", bitfield[byte_num], 128 >> nth);
                                 if bitfield[byte_num] & 128 >> nth != 0 {
                                     println!("has piece {}", i);
+                                    has_pieces_vec.push(true);
                                     has_pieces += 1;
                                 } else {
+                                    has_pieces_vec.push(false);
                                     println!("missing piece {}", i);
                                 }
                             }
                             println!("has {} of {} pieces - {}%", has_pieces, num_of_pieces, (has_pieces / num_of_pieces) * 100);
-                            todo!("bitfield")
+                            PeerEvent::GotBitfield { has_pieces: has_pieces_vec }
                         },
                         Message::Request { index, begin, length } => todo!("ignoring request msg - index={}, begin={}, length={}", index, begin, length),
                         Message::Piece { length, index, begin, block } => {
@@ -1212,8 +1253,65 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                     })
                 },
                 _ => None,
-            }
-        _ => todo!()
+        },
+        PeerConnectionState::MessagePieceReceive {
+            attempt,
+            index,
+            missing_bytes,
+            buff,
+            their_state } => match conn.event {
+                Some(PeerEvent::PieceIncomplete { index, missing_bytes }) => {
+                    Some(match stream_to_buffer_partial(&mut conn.stream, buff) {
+                        StreamResultPartial::Read(c) => {
+                            if c == 0 {
+                                if *attempt > 5 {
+                                    epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
+                                    PeerEvent::GiveUp
+                                } else {
+                                    PeerEvent::Retry
+                                }
+                            } else {
+                                epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
+
+                                println!("piece in progress, appending...");
+                                torrent.data.append_to_piece(index, buff.get(0..c).unwrap().to_vec()).expect("append_to_piece");
+
+                                if c == missing_bytes {
+                                    println!("got the rest of missing bytes!");
+                                    if torrent.pieces.hash_for_index(index) == torrent.data.get_piece(index).unwrap().hash() {
+                                        torrent.data.mark_piece_completed(index).expect("mark_piece_completed");
+                                    }
+
+                                    PeerEvent::PieceCompleted { index }
+
+                                } else {
+                                    PeerEvent::PieceIncomplete { index, missing_bytes: missing_bytes - c }
+                                }
+                            }
+                        },
+                        StreamResultPartial::WouldBlock => would_block_read(epoll, &conn.stream, conn.peer_id as u64),
+                    })
+                },
+                _ => todo!()
+        },
+        PeerConnectionState::SendHave { index } => match conn.event {
+            Some(PeerEvent::PieceCompleted { .. } | PeerEvent::CanWrite) => {
+                let have_msg = Message::Have { piece_index: *index };
+                println!("sending have message: {}", have_msg);
+                let have_msg = have_msg.to_bytes();
+                match buffer_to_stream(&mut conn.stream, &have_msg) {
+                    StreamResult::Done => Some(PeerEvent::SendHaveOk),
+                    StreamResult::Partial(_) => todo!(),
+                    StreamResult::WouldBlock => Some(PeerEvent::WouldBlock),
+                }
+            },
+            _ => todo!(),
+        },
+        PeerConnectionState::SendRequestPiece => todo!(),
+        PeerConnectionState::Start { .. } => None,
+        PeerConnectionState::MismatchedInfoHashes => None,
+        PeerConnectionState::GaveUpOnPeer => None,
+
     }
 }
 
