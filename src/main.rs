@@ -325,7 +325,7 @@ impl Torrent {
                     println!("piece in progress, appending...");
                     data.append_to_piece(pi.index, buff.get(0..bytes_read).unwrap().to_vec())?;
 
-                    if bytes_read as u32 == pi.missing_bytes {
+                    if bytes_read == pi.missing_bytes {
                         println!("got the rest of missing bytes!");
                         if self.pieces.hash_for_index(pi.index) == data.get_piece(pi.index).unwrap().hash() {
                             data.mark_piece_completed(pi.index)?;
@@ -343,7 +343,7 @@ impl Torrent {
                 None => println!("no piece in progress; parsing as regular message"),
             }
             if !skip_parsing {
-                let parsed = match Message::from_bytes(&buff, bytes_read as u32) {
+                let parsed = match Message::from_bytes(&buff, bytes_read) {
                     Ok(m) => m,
                     Err(e) => return Err(e),
                 };
@@ -411,7 +411,7 @@ impl Torrent {
                         println!("ignoring request msg - index={}, begin={}, length={}", index, begin, length)
                     },
                     Message::Piece { length, index, begin, block } => {
-                        let block_len = block.len() as u32;
+                        let block_len = block.len();
                         data.append_to_piece(index, block)?;
                         // 9 = size of piece message minus the block bytes
                         if (length - 9) > block_len {
@@ -752,17 +752,18 @@ enum PeerConnectionState {
         buff: [u8; 68] // expecting 68 for handshake, 49+len(pstr) assuming pstr="BitTorrent protocol"
     },
     InterestedSending { message: Vec<u8> },
-    MessageLoopRead {
+    MessageRead {
         attempt: i8,
         buff: [u8; 65536]
     },
-    MessageLoopProcess {
+    MessageParse {
+        bytes_read: usize,
+        buff: [u8; 65536],
         our_state: PeerState,
         their_state: PeerState,
         block_index_in_progress: Option<PieceInProgress>,
         skip_parsing: bool,
         piece_completed_index: Option<u32>,
-        buff: [u8; 65536]
     },
 
     // terminal states
@@ -785,11 +786,11 @@ impl fmt::Display for PeerConnectionState {
             PeerConnectionState::InterestedSending { .. } => {
                 writeln!(f, "State::InterestedSending")
             },
-            PeerConnectionState::MessageLoopRead { attempt, .. } => {
+            PeerConnectionState::MessageRead { attempt, .. } => {
                 writeln!(f, "State::MessageLoopRead attempt={}, buff=[..]", attempt)
             },
-            PeerConnectionState::MessageLoopProcess { our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index, buff } => {
-                writeln!(f, "State::MessageLoopProcess our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, piece_completed_index={:?}, buff=[..]", our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index)
+            PeerConnectionState::MessageParse { bytes_read, our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index, buff } => {
+                writeln!(f, "State::MessageLoopProcess bytes_read={} our_state={:?}, their_state={:?}, block_index_in_progress={:?}, skip_parsing={}, piece_completed_index={:?}, buff=[..]", bytes_read, our_state, their_state, block_index_in_progress, skip_parsing, piece_completed_index)
             },
             PeerConnectionState::MismatchedInfoHashes => {
                 writeln!(f, "State::MismatchedInfoHashes")
@@ -808,7 +809,7 @@ enum PeerEvent {
     HandshakeReceiveOk,
     MismatchedInfoHashes,
     InterestedSentOk,
-    MessageLoopReadOk,
+    MessageLoopReadOk { byte_count: usize },
     WouldBlock,
     CanRead,
     CanWrite,
@@ -998,14 +999,15 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
             _ => state
         },
         PeerConnectionState::InterestedSending { .. } => match event {
-            PeerEvent::InterestedSentOk => PeerConnectionState::MessageLoopRead {
+            PeerEvent::InterestedSentOk => PeerConnectionState::MessageRead {
                 attempt: 0,
                 buff: [0; 65536]
             },
             _ => state
         },
-        PeerConnectionState::MessageLoopRead { attempt, buff } => match event {
-            PeerEvent::MessageLoopReadOk => PeerConnectionState::MessageLoopProcess {
+        PeerConnectionState::MessageRead { attempt, buff } => match event {
+            PeerEvent::MessageLoopReadOk { byte_count } => PeerConnectionState::MessageParse {
+                bytes_read: *byte_count,
                 our_state: PeerState::ChokingInterested,
                 their_state: PeerState::ChokingNotInterested,
                 block_index_in_progress: None,
@@ -1013,11 +1015,11 @@ fn connection_state_machine(state: PeerConnectionState, event: &PeerEvent) -> Pe
                 piece_completed_index: None,
                 buff
             },
-            PeerEvent::Retry => PeerConnectionState::MessageLoopRead { attempt: attempt + 1, buff },
+            PeerEvent::Retry => PeerConnectionState::MessageRead { attempt: attempt + 1, buff },
             PeerEvent::GiveUp => PeerConnectionState::GaveUpOnPeer,
             _ => state
         },
-        PeerConnectionState::MessageLoopProcess { .. } => todo!(),
+        PeerConnectionState::MessageParse { .. } => todo!(),
 
         // terminal states ignore all events, can't transition out of them
         PeerConnectionState::MismatchedInfoHashes => state,
@@ -1089,7 +1091,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             },
             _ => todo!()
         },
-        PeerConnectionState::MessageLoopRead { attempt, buff } => match conn.event {
+        PeerConnectionState::MessageRead { attempt, buff } => match conn.event {
             Some(PeerEvent::InterestedSentOk) | Some(PeerEvent::CanRead) | Some(PeerEvent::Retry) => {
                 match stream_to_buffer_partial(&mut conn.stream, buff) {
                     StreamResultPartial::Read(c) => {
@@ -1102,7 +1104,7 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
                             }
                         } else {
                             epoll.delete(conn.stream.as_raw_fd()).expect("epoll_delete");
-                            Some(PeerEvent::MessageLoopReadOk)
+                            Some(PeerEvent::MessageLoopReadOk { byte_count: c })
                         }
                     },
                     StreamResultPartial::WouldBlock => Some(would_block_read(epoll, &conn.stream, conn.peer_id as u64)),
@@ -1110,14 +1112,16 @@ fn state_effects(epoll: &mut Epoll, torrent: &mut Torrent, conn: &mut PeerConnec
             },
             _ => todo!()
         },
-        PeerConnectionState::MessageLoopProcess {
+        PeerConnectionState::MessageParse {
+            bytes_read,
             our_state,
             their_state,
             block_index_in_progress,
             skip_parsing,
             piece_completed_index,
             buff } => match conn.event {
-                _ => todo!()
+                Some(_) => todo!(),
+                None => todo!(),
             }
         _ => todo!()
     }

@@ -10,7 +10,7 @@ pub enum Message {
     Have { piece_index: u32 },
     Bitfield { bitfield: Vec<u8> },
     Request { index: u32, begin: u32, length: u32 },
-    Piece { length: u32, index: u32, begin: u32, block: Vec<u8> },
+    Piece { length: usize, index: u32, begin: u32, block: Vec<u8> },
     Cancel { index: u32, begin: u32, length: u32 },
     Port { listen_port: u16 }
 }
@@ -34,7 +34,7 @@ impl fmt::Display for Message {
 }
 
 impl Message {
-    pub fn from_bytes(bytes: &[u8], bytes_read: u32) -> Result<Message, &'static str> {
+    pub fn from_bytes(bytes: &[u8], bytes_read: usize) -> Result<Message, &'static str> {
         println!("parsing msg, bytes len={}", bytes.len());
         println!("first 20 bytes: {:x?}", bytes.get(..20));
         let bytes = bytes.get(0..bytes_read as usize);
@@ -42,8 +42,8 @@ impl Message {
             return Err("empty buffer")
         }
         let bytes = bytes.unwrap();
-        let length = match bytes.get(0..4) {
-            Some(bx) => u32::from_be_bytes([bx[0], bx[1], bx[2], bx[3]]),
+        let length: usize = match bytes.get(0..4) {
+            Some(bx) => usize::from_be_bytes([bx[0], bx[1], bx[2], bx[3], 0, 0, 0, 0]),
             None => return Err("missing length bytes"),
         };
         println!("got length={}", length);
